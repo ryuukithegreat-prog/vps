@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#172923" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>SAEKA VPN | Account Access</title>
+    <link rel="stylesheet" href="/portal.css?v=1790398829" />
+    <link rel="stylesheet" href="/extras.css?v=1790400669" />
+    <script src="/portal.js?v=1790400669" defer></script>
+  </head>
+  <body>
+<div id="toastStack" aria-live="polite"></div>
+
+<div id="globalLoader" aria-hidden="true" style="display:none">
+  <div class="spin-box">
+    <div class="spin-ring"></div>
+    <div class="spin-label" id="globalLoaderLabel">Working...</div>
+  </div>
+</div>
+
+
+<aside id="welcomeTour" class="welcome-tour" hidden>
+  <div class="welcome-card">
+    <button type="button" class="welcome-skip" id="welcomeSkip" aria-label="Skip tour">Skip</button>
+    <p class="welcome-kicker">FIRST TIME HERE</p>
+    <h2>Welcome to your VPN portal</h2>
+    <p class="welcome-lede">Three quick steps and you are set up.</p>
+    <ol class="welcome-steps">
+      <li>
+        <strong>Change your password</strong>
+        <span>Tap <em>Change password</em> at the top right. Pick something only you know.</span>
+      </li>
+      <li>
+        <strong>Download your config</strong>
+        <span>Hit <em>Download config</em> below. The file contains your key — keep it private.</span>
+      </li>
+      <li>
+        <strong>Import into your client</strong>
+        <span>Open your VPN app (WireGuard / OpenVPN / v2rayNG / SSH client) and import the file.</span>
+      </li>
+    </ol>
+    <button type="button" class="welcome-go" id="welcomeDismiss">Got it</button>
+  </div>
+</aside>
+
+    <div class="portal-shell">
+      <header class="portal-topbar">
+        <a class="portal-brand" href="/" aria-label="SAEKA VPN home">
+          <span class="portal-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 6h16v12H4zM7 10l2 2-2 2m5 1h4" /></svg></span>
+          <span><strong>SAEKA VPN</strong><small>PRIVATE NETWORK ACCESS</small></span>
+        </a>
+        <div class="portal-tools">
+          <span class="portal-host" id="portalHost"></span>
+          <button class="portal-text-button" id="portalPasswordButton" type="button" hidden>Change password</button>
+          <button class="portal-text-button" id="portalSignOutButton" type="button" hidden>Sign out</button>
+          <a class="portal-admin-link" href="/admin/">Admin</a>
+        </div>
+      </header>
+
+      <main class="portal-main">
+        <section class="portal-login" id="portalLogin" aria-labelledby="loginHeading">
+          <div class="login-intro-block">
+            <p class="portal-kicker">CLIENT ACCESS / SECURE SIGN-IN</p>
+            <h1 id="loginHeading">Your private<br />network.</h1>
+            <p class="login-description">Sign in with the account credentials provided by your administrator.</p>
+            <div class="login-signal" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></div>
+            <p class="login-signal-label">ENCRYPTED / PRIVATE ACCESS</p>
+          </div>
+          <form class="portal-login-form" id="portalLoginForm">
+            <p class="portal-kicker">ACCOUNT SIGN-IN</p>
+            <h2>Welcome back</h2>
+            <label for="portalUsername">Account name</label>
+            <input id="portalUsername" name="username" type="text" autocomplete="username" maxlength="32" required />
+            <label for="portalPassword">Password</label>
+            <input id="portalPassword" name="password" type="password" autocomplete="current-password" required />
+            <p class="portal-error" id="portalLoginError" role="alert" hidden></p>
+            <button class="portal-button portal-button-dark portal-button-wide" id="portalLoginSubmit" type="submit"><span>Sign in</span><span aria-hidden="true">→</span></button>
+            <p class="portal-form-note">VPN access is managed by your administrator.</p>
+          </form>
+        </section>
+
+        <section class="portal-dashboard" id="portalDashboard" hidden aria-labelledby="accountHeading">
+          <div class="portal-heading">
+            <div><p class="portal-kicker">ACCOUNT / OVERVIEW</p><h1 id="accountHeading">Your account</h1><p class="portal-subheading">Private <span id="portalAccountProtocol">VPN</span> access for <strong id="portalAccountName"></strong></p></div>
+            <div class="portal-live-indicator" id="portalLiveIndicator"><span class="portal-live-dot" id="liveDot"></span><span><strong id="liveLabel">Connecting</strong><small id="lastUpdated">Waiting for account status</small></span></div>
+          </div>
+
+          <div class="portal-notice" id="portalError" role="alert" hidden></div>
+          <div class="portal-metrics" aria-live="polite">
+            <article class="portal-metric portal-status-metric"><p>VPN status</p><strong id="accountStatus">—</strong><small id="accountStatusHint">Checking current handshake</small></article>
+            <article class="portal-metric"><p>Assigned address</p><strong class="metric-mono" id="accountAddress">—</strong><small id="accountAddressHint">VPN address</small></article>
+            <article class="portal-metric"><p>Account runtime</p><strong id="accountAge">—</strong><small>Since account creation</small></article>
+            <article class="portal-metric"><p>Access remaining</p><strong id="accountRemaining">—</strong><small id="accountExpiry">No expiry</small></article>
+          </div>
+
+          <section class="portal-detail-section" aria-labelledby="connectionHeading">
+            <div class="portal-section-heading"><div><p class="portal-kicker">WIREGUARD / LIVE TELEMETRY</p><h2 id="connectionHeading">Connection details</h2></div><span class="portal-refresh-label">Updates every 5 seconds</span></div>
+            <dl class="portal-detail-grid">
+              <div><dt>Server endpoint</dt><dd id="accountEndpoint">No active endpoint</dd></div>
+              <div><dt>Last handshake</dt><dd id="accountHandshake">No handshake yet</dd></div>
+              <div><dt>Data uploaded</dt><dd id="accountUploaded">—</dd></div>
+              <div><dt>Data downloaded</dt><dd id="accountDownloaded">—</dd></div>
+              <div><dt>Access term</dt><dd id="accountTerm">—</dd></div>
+              <div><dt>Created</dt><dd id="accountCreated">—</dd></div>
+            </dl>
+          </section>
+
+          <section class="portal-connect-row">
+            <div><p class="portal-kicker">DEVICE CONFIGURATION</p><h2>Connect a device</h2><p>Download your private <span id="portalConfigProtocol">VPN</span> profile. Keep the file and password to yourself.</p></div>
+            <button class="portal-button portal-button-dark" id="downloadPortalConfig" type="button"><span id="downloadLabel">Download config</span><span aria-hidden="true">↓</span></button>
+          </section>
+          <footer class="portal-footer"><span>SAEKA VPN / PRIVATE ACCESS</span><span>Keep your credentials private</span></footer>
+        </section>
+      </main>
+    </div>
+
+    <div class="activity-punch" id="activityPunch" role="status" aria-live="polite" hidden><span class="punch-mark" aria-hidden="true"></span><span id="activityPunchText"></span></div>
+
+    <dialog class="portal-dialog" id="portalPasswordDialog" aria-labelledby="portalPasswordTitle">
+      <form class="portal-password-form" id="portalPasswordForm">
+        <p class="portal-kicker">ACCOUNT SECURITY</p>
+        <h2 id="portalPasswordTitle">Change password</h2>
+        <p class="portal-dialog-copy" id="portalPasswordCopy">Choose a new password with at least 14 characters.</p>
+        <label for="portalCurrentPassword">Current password</label><input id="portalCurrentPassword" name="currentPassword" type="password" autocomplete="current-password" required />
+        <label for="portalNewPassword">New password</label><input id="portalNewPassword" name="newPassword" type="password" minlength="14" maxlength="256" autocomplete="new-password" required />
+        <label for="portalConfirmPassword">Confirm new password</label><input id="portalConfirmPassword" name="confirmPassword" type="password" minlength="14" maxlength="256" autocomplete="new-password" required />
+        <p class="portal-error" id="portalPasswordError" role="alert" hidden></p>
+        <div class="portal-dialog-actions"><button class="portal-button portal-button-quiet" id="cancelPortalPassword" type="button">Cancel</button><button class="portal-button portal-button-dark" id="savePortalPassword" type="submit">Update password</button></div>
+      </form>
+    </dialog>
+  </body>
+</html>
