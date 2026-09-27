@@ -8,7 +8,7 @@ The installer configures WireGuard, OpenVPN, IKEv2/IPsec, the client portal, and
 
 ## Management
 
-After installation, run `vpn-admin` for the interactive terminal menu. Commands include `status`, `protocols`, `cert`, `domain`, `webcheck`, `logs`, `restart`, and `adblock {status|on|off}`. Use `vpn-admin domain` for DNS and TLS setup guidance. The install command shown by the panel or terminal is for a fresh VPS; changing a production host is not currently an automated operation.
+After installation, run `vpn-admin` for the interactive terminal menu. Commands include `status`, `protocols`, `cert`, `domain`, `webcheck`, `logs`, `restart`, `adblock {status|on|off}`, and `maintenance {status|internet-on|internet-off}`. Use `vpn-admin domain` for DNS and TLS setup guidance. The maintenance internet pause affects forwarded IPv4 traffic from WireGuard/OpenVPN clients, not Xray/SSH/IPsec proxy traffic. The installer command shown by the panel or terminal is for a fresh VPS; changing a production host is not currently an automated operation.
 
 ## Local Verification
 

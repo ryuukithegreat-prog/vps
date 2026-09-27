@@ -51,6 +51,7 @@ done
 
 check_shell_syntax setup-vpn-stack.sh
 check_shell_syntax vpn-admin.sh
+check_shell_syntax vpn-maintenance-firewall.sh
 check_shell_syntax verify-vpn-stack.sh
 check_shell_syntax deploy.sh
 if python3 -c 'import ast,pathlib; [ast.parse(pathlib.Path(path).read_text(), filename=path) for path in ("vpn-status.py", "admin-api.py")]'; then
@@ -89,6 +90,7 @@ check_file web-panel/console.js
 check_file web-panel/portal.html
 check_file web-panel/portal.js
 check_file web-panel/portal.css
+check_file vpn-maintenance-firewall.sh
 grep -q 'try_files /portal.html =404' setup-vpn-stack.sh \
   && pass 'domain root serves the client portal' \
   || fail 'client portal root route is missing'

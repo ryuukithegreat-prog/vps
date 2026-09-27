@@ -40,6 +40,9 @@ ADBLOCK_CONFIG_PATH = Path(os.environ.get("ADBLOCK_CONFIG_PATH", "/etc/dnsmasq.d
 ADBLOCK_HOSTS_PATH = Path(os.environ.get("ADBLOCK_HOSTS_PATH", "/var/lib/vpnfront/ads.hosts"))
 ADBLOCK_STATE_PATH = Path(os.environ.get("ADBLOCK_STATE_PATH", "/var/lib/vpnfront/adblock.json"))
 MAINTENANCE_STATE_PATH = Path(os.environ.get("MAINTENANCE_STATE_PATH", "/var/lib/vpnfront/maintenance.json"))
+MAINTENANCE_FIREWALL_COMMAND = os.environ.get(
+    "MAINTENANCE_FIREWALL_COMMAND", "/usr/local/sbin/vpn-maintenance-firewall"
+)
 ADBLOCK_SOURCE_URL = "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
 ADBLOCK_LEVELS = {
     "light": {
@@ -62,6 +65,7 @@ BLOCKED_DOMAIN_PATTERN = re.compile(
 MAX_BLOCKED_DOMAINS = 500
 WG_CLIENT_NETWORK = ipaddress.ip_network("10.42.0.0/24")
 WG_GATEWAY_ADDRESS = ipaddress.ip_address("10.42.0.1")
+WG_ROUTE_MODES = {"full": "0.0.0.0/0", "split": str(WG_CLIENT_NETWORK)}
 WG_DEFAULT_PORT = 51820
 WG_HANDSHAKE_ACTIVE_SECONDS = 180
 CLIENT_DURATION_OPTIONS = {0, 1, 7, 30, 90}
@@ -156,6 +160,8 @@ def init_database():
             connection.execute("ALTER TABLE vpn_clients ADD COLUMN protocol TEXT NOT NULL DEFAULT 'wireguard'")
         if "metadata" not in client_columns:
             connection.execute("ALTER TABLE vpn_clients ADD COLUMN metadata TEXT")
+        if "route_mode" not in client_columns:
+            connection.execute("ALTER TABLE vpn_clients ADD COLUMN route_mode TEXT NOT NULL DEFAULT 'full'")
     if DB_PATH.exists():
         os.chmod(DB_PATH, 0o600)
 
@@ -493,16 +499,60 @@ def read_maintenance_state():
     message = state.get("message", "")
     if not isinstance(message, str):
         message = ""
-    return {"enabled": state.get("enabled") is True, "message": message[:500]}
+    return {
+        "enabled": state.get("enabled") is True,
+        "message": message[:500],
+        "blockInternet": state.get("block_internet") is True,
+    }
 
 
-def set_maintenance_state(enabled, message):
+def set_vpn_forwarding_block(enabled):
+    if not isinstance(enabled, bool):
+        raise ValueError("Internet pause must be enabled or disabled.")
+    result = subprocess.run(
+        [MAINTENANCE_FIREWALL_COMMAND, "enable" if enabled else "disable"],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("Could not update the VPN maintenance firewall rules.")
+
+
+def set_maintenance_state(enabled, message, block_internet=False):
     if not isinstance(enabled, bool):
         raise ValueError("Maintenance notice must be enabled or disabled.")
+    if not isinstance(block_internet, bool):
+        raise ValueError("Internet pause must be enabled or disabled.")
+    if block_internet and not enabled:
+        raise ValueError("Enable the client maintenance notice when pausing VPN internet access.")
     if not isinstance(message, str) or len(message) > 500:
         raise ValueError("Maintenance notice must be 500 characters or fewer.")
-    state = {"enabled": enabled, "message": message.strip()}
-    _atomic_private_write(MAINTENANCE_STATE_PATH, json.dumps(state, separators=(",", ":")) + "\n")
+    previous = read_maintenance_state()
+    state = {"enabled": enabled, "message": message.strip(), "blockInternet": block_internet}
+    persisted = {"enabled": enabled, "message": message.strip(), "block_internet": block_internet}
+    _atomic_private_write(MAINTENANCE_STATE_PATH, json.dumps(persisted, separators=(",", ":")) + "\n")
+    try:
+        set_vpn_forwarding_block(block_internet)
+    except (OSError, RuntimeError, subprocess.TimeoutExpired):
+        _atomic_private_write(
+            MAINTENANCE_STATE_PATH,
+            json.dumps(
+                {
+                    "enabled": previous["enabled"],
+                    "message": previous["message"],
+                    "block_internet": previous["blockInternet"],
+                },
+                separators=(",", ":"),
+            )
+            + "\n",
+        )
+        try:
+            set_vpn_forwarding_block(previous["blockInternet"])
+        except (OSError, RuntimeError, subprocess.TimeoutExpired):
+            logger.exception("Failed to restore VPN forwarding after maintenance update failure")
+        raise
     return state
 
 
@@ -605,8 +655,15 @@ def set_adblock_enabled(enabled, level=None, blocked_domains=None):
         raise
 
 
-def create_wireguard_client(username, duration_days):
+def validate_wireguard_route_mode(route_mode):
+    if not isinstance(route_mode, str) or route_mode not in WG_ROUTE_MODES:
+        raise ValueError("WireGuard route mode must be full or split.")
+    return route_mode
+
+
+def create_wireguard_client(username, duration_days, route_mode="full"):
     username = validate_client_name(username)
+    route_mode = validate_wireguard_route_mode(route_mode)
     if duration_days is not None and (isinstance(duration_days, bool) or not isinstance(duration_days, int) or duration_days < 0):
         raise ValueError("Invalid duration.")
 
@@ -642,8 +699,8 @@ def create_wireguard_client(username, duration_days):
             _write_wireguard_config(config_text)
             raise
         connection.execute(
-            "INSERT INTO vpn_clients(id, username, public_key, private_key, address, created_at, expires_at, password_salt, password_hash, must_change_password) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
-            (client_id, username, public_key, private_key, str(address), now, expires_at, password_salt, password_hash),
+            "INSERT INTO vpn_clients(id, username, public_key, private_key, address, created_at, expires_at, password_salt, password_hash, must_change_password, route_mode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+            (client_id, username, public_key, private_key, str(address), now, expires_at, password_salt, password_hash, route_mode),
         )
         client_config = (
             "[Interface]\n"
@@ -653,10 +710,10 @@ def create_wireguard_client(username, duration_days):
             "[Peer]\n"
             f"PublicKey = {server_public_key}\n"
             f"Endpoint = {endpoint}\n"
-            "AllowedIPs = 0.0.0.0/0\n"
+            f"AllowedIPs = {WG_ROUTE_MODES[route_mode]}\n"
             "PersistentKeepalive = 25\n"
         )
-    return {"id": client_id, "username": username, "protocol": "wireguard", "address": str(address), "createdAt": now, "expiresAt": expires_at, "temporaryPassword": temporary_password}, client_config
+    return {"id": client_id, "username": username, "protocol": "wireguard", "address": str(address), "createdAt": now, "expiresAt": expires_at, "temporaryPassword": temporary_password, "routeMode": route_mode}, client_config
 
 
 
@@ -1589,7 +1646,7 @@ def list_wireguard_clients(now=None):
     peer_metrics = _wireguard_peer_metrics()
     with database() as connection:
         rows = connection.execute(
-            "SELECT id, username, public_key, address, created_at, expires_at, password_hash FROM vpn_clients WHERE COALESCE(protocol, 'wireguard') = 'wireguard' ORDER BY created_at DESC"
+            "SELECT id, username, public_key, address, created_at, expires_at, password_hash, route_mode FROM vpn_clients WHERE COALESCE(protocol, 'wireguard') = 'wireguard' ORDER BY created_at DESC"
         ).fetchall()
     clients = []
     for row in rows:
@@ -1599,6 +1656,7 @@ def list_wireguard_clients(now=None):
             "id": row["id"],
             "username": row["username"],
             "protocol": "wireguard",
+            "routeMode": row["route_mode"] if row["route_mode"] in WG_ROUTE_MODES else "full",
             "address": row["address"],
             "createdAt": row["created_at"],
             "expiresAt": row["expires_at"],
@@ -1913,7 +1971,7 @@ def get_wireguard_client_account(client_id, now=None):
 def get_wireguard_client_config(client_id):
     with database() as connection:
         row = connection.execute(
-            "SELECT username, private_key, address, expires_at FROM vpn_clients WHERE id = ?",
+            "SELECT username, private_key, address, expires_at, route_mode FROM vpn_clients WHERE id = ?",
             (client_id,),
         ).fetchone()
     if row is None:
@@ -1930,7 +1988,7 @@ def get_wireguard_client_config(client_id):
         "[Peer]\n"
         f"PublicKey = {server_public_key}\n"
         f"Endpoint = {endpoint}\n"
-        "AllowedIPs = 0.0.0.0/0\n"
+        f"AllowedIPs = {WG_ROUTE_MODES.get(row['route_mode'], WG_ROUTE_MODES['full'])}\n"
         "PersistentKeepalive = 25\n"
     )
 
@@ -2464,9 +2522,16 @@ class AdminHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/maintenance":
             try:
-                state = set_maintenance_state(payload.get("enabled"), payload.get("message", ""))
+                state = set_maintenance_state(
+                    payload.get("enabled"),
+                    payload.get("message", ""),
+                    payload.get("blockInternet", False),
+                )
             except ValueError as exc:
                 self.send_json(400, {"error": str(exc)})
+                return
+            except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+                self.send_json(503, {"error": str(exc)})
                 return
             logger.info("admin=%s action=maintenance_notice enabled=%s", session["username"], state["enabled"])
             self.send_json(200, {"maintenance": state})
@@ -2497,6 +2562,7 @@ class AdminHandler(BaseHTTPRequestHandler):
                 protocol = protocol.lower()
                 if protocol not in {"wireguard", "xray", "ssh", "openvpn", "ipsec"}:
                     raise ValueError("Unsupported VPN protocol.")
+                route_mode = validate_wireguard_route_mode(payload.get("routeMode", "full"))
                 if not isinstance(skip_password, bool):
                     raise ValueError("skipPassword must be true or false.")
                 if skip_password and provided_password is not None:
@@ -2517,7 +2583,7 @@ class AdminHandler(BaseHTTPRequestHandler):
                 elif protocol == "ipsec":
                     client, config = create_ipsec_client(username, duration_days)
                 elif protocol == "wireguard":
-                    client, config = create_wireguard_client(username, duration_days)
+                    client, config = create_wireguard_client(username, duration_days, route_mode)
                 else:
                     raise ValueError("Unsupported VPN protocol.")
             except ValueError as exc:
@@ -2773,6 +2839,8 @@ def serve(host, port):
     if not address.is_loopback:
         raise ValueError("The admin API must bind to a loopback address.")
     init_database()
+    if read_maintenance_state()["blockInternet"]:
+        set_vpn_forwarding_block(True)
     threading.Thread(target=wireguard_expiry_worker, daemon=True, name="wireguard-expiry").start()
     server = ThreadingHTTPServer((host, port), AdminHandler)
     server.daemon_threads = True

@@ -14,7 +14,7 @@
   ];
 
   let open = false;
-  let state = { step: 1, username: '', password: '', skipPassword: false, unit: 'days', value: 30, date: '', protocol: 'wireguard' };
+  let state = { step: 1, username: '', password: '', skipPassword: false, unit: 'days', value: 30, date: '', protocol: 'wireguard', routeMode: 'full' };
 
   function esc(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -80,6 +80,14 @@
         <select id="wizProto" class="wiz-input">
           ${PROTOCOLS.map(p => `<option value="${p.v}"${p.v === state.protocol ? ' selected' : ''}>${p.label}</option>`).join('')}
         </select>
+        <div id="wizRouteWrap" ${state.protocol === 'wireguard' ? '' : 'hidden'}>
+          <label class="wiz-label" for="wizRoute">WireGuard routing</label>
+          <select id="wizRoute" class="wiz-input">
+            <option value="full"${state.routeMode === 'full' ? ' selected' : ''}>Full tunnel · all IPv4 traffic uses VPN</option>
+            <option value="split"${state.routeMode === 'split' ? ' selected' : ''}>Split tunnel · VPN subnet only</option>
+          </select>
+          <p class="wiz-hint">Split tunnel leaves general internet traffic on the device's normal connection.</p>
+        </div>
         <label class="wiz-label">Username</label>
         <input id="wizUser" class="wiz-input" type="text" maxlength="48" placeholder="e.g. alice-laptop" value="${esc(state.username)}" autocomplete="off" />
         <p class="wiz-err" id="wizErr" hidden></p>
@@ -95,9 +103,16 @@
         }
         state.username = u;
         state.protocol = pr;
+        state.routeMode = document.getElementById('wizRoute').value;
         state.step = 2;
         render();
         return false;
+      },
+      after: () => {
+        const protocol = document.getElementById('wizProto');
+        protocol.onchange = () => {
+          document.getElementById('wizRouteWrap').hidden = protocol.value !== 'wireguard';
+        };
       },
       back: null,
     };
@@ -204,6 +219,7 @@
           <div><dt>Username</dt><dd>${esc(state.username)}</dd></div>
           <div><dt>Portal password</dt><dd>${state.skipPassword ? '<em class="wiz-muted">Skipped — VPN only</em>' : '<code>' + esc(state.password) + '</code>'}</dd></div>
           <div><dt>Duration</dt><dd>${esc(durationLabel())}</dd></div>
+          ${state.protocol === 'wireguard' ? `<div><dt>Routing</dt><dd>${state.routeMode === 'split' ? 'Split tunnel / VPN subnet only' : 'Full tunnel / all IPv4'}</dd></div>` : ''}
         </dl>
         <p class="wiz-hint">Creates the account immediately. You can revoke it anytime.</p>
       `,
@@ -216,6 +232,7 @@
             protocol: state.protocol,
             durationSeconds: durationSeconds(),
           };
+          if (state.protocol === 'wireguard') body.routeMode = state.routeMode;
           if (state.skipPassword) body.skipPassword = true;
           else body.password = state.password;
 
@@ -281,7 +298,7 @@
   }
 
   function openWizard() {
-    state = { step: 1, username: '', password: '', skipPassword: false, unit: 'days', value: 30, date: '', protocol: 'wireguard' };
+    state = { step: 1, username: '', password: '', skipPassword: false, unit: 'days', value: 30, date: '', protocol: 'wireguard', routeMode: 'full' };
     const root = document.getElementById('wizRoot') || buildModal();
     root.setAttribute('aria-hidden', 'false');
     root.classList.add('wiz-open');

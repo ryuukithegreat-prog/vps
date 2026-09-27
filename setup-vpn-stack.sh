@@ -374,6 +374,7 @@ write_status_reporter() {
 
 configure_admin_api() {
   install -m 755 "$SCRIPT_DIR/admin-api.py" /usr/local/bin/vpn-admin-api
+  install -o root -g root -m 0755 "$SCRIPT_DIR/vpn-maintenance-firewall.sh" /usr/local/sbin/vpn-maintenance-firewall
   VPN_ADMIN_DB=/var/lib/vpnfront/admin.sqlite3 \
     VPN_ADMIN_INITIAL_USER="$ADMIN_USERNAME" \
     VPN_ADMIN_INITIAL_PASSWORD="$ADMIN_PASSWORD" \
@@ -647,6 +648,10 @@ EOF
 
 configure_dns_filter() {
   mkdir -p /etc/dnsmasq.d /etc/systemd/system/dnsmasq.service.d /var/lib/vpnfront
+  if [[ ! -f /var/lib/vpnfront/maintenance.json ]]; then
+    printf '{"enabled":false,"message":"","block_internet":false}\n' >/var/lib/vpnfront/maintenance.json
+  fi
+  chmod 600 /var/lib/vpnfront/maintenance.json
   touch /var/lib/vpnfront/ads-source.hosts /var/lib/vpnfront/ads.hosts
   chmod 644 /var/lib/vpnfront/ads-source.hosts /var/lib/vpnfront/ads.hosts
   if [[ ! -f /var/lib/vpnfront/adblock.json ]]; then

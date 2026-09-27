@@ -104,6 +104,49 @@ show_adblock() {
   systemctl --no-pager status dnsmasq vpn-adblock-update.timer --lines=8 || true
 }
 
+manage_maintenance_internet() {
+  local choice="${1:-status}"
+  local state=/var/lib/vpnfront/maintenance.json
+  local temporary backup previous
+  if [[ ! -f "$state" ]]; then
+    echo "Maintenance state is not initialized."
+    return 1
+  fi
+  case "$choice" in
+    status)
+      jq '{enabled, message, block_internet}' "$state"
+      printf 'Forwarding firewall: '
+      /usr/local/sbin/vpn-maintenance-firewall status
+      ;;
+    internet-on|internet-off)
+      if [[ "$choice" == internet-on ]] && [[ "$(jq -r '.enabled // false' "$state")" != true ]]; then
+        echo "Enable a client maintenance notice before pausing internet forwarding." >&2
+        return 1
+      fi
+      previous="$(jq -r '.block_internet // false' "$state")"
+      temporary="$(mktemp /var/lib/vpnfront/maintenance.XXXXXX)"
+      backup="$(mktemp /var/lib/vpnfront/maintenance-backup.XXXXXX)"
+      cp -p "$state" "$backup"
+      jq --argjson paused "$([[ "$choice" == internet-on ]] && printf true || printf false)" \
+        '.block_internet = $paused' "$state" >"$temporary"
+      chmod 600 "$temporary"
+      mv "$temporary" "$state"
+      if ! /usr/local/sbin/vpn-maintenance-firewall "$([[ "$choice" == internet-on ]] && printf enable || printf disable)"; then
+        mv "$backup" "$state"
+        /usr/local/sbin/vpn-maintenance-firewall "$([[ "$previous" == true ]] && printf enable || printf disable)" || true
+        echo "Could not apply maintenance firewall rules; previous state restored." >&2
+        return 1
+      fi
+      rm -f "$backup"
+      manage_maintenance_internet status
+      ;;
+    *)
+      echo "Usage: $0 maintenance {status|internet-on|internet-off}" >&2
+      return 2
+      ;;
+  esac
+}
+
 toggle_adblock() {
   local choice="${1:-}"
   local config=/etc/dnsmasq.d/vpnfront-adblock.conf
@@ -186,6 +229,9 @@ while [[ $# -gt 0 ]]; do
     protocols) show_protocols; exit 0 ;;
     cert) check_cert; exit 0 ;;
     domain) show_domain_guide; exit 0 ;;
+    maintenance)
+      manage_maintenance_internet "${2:-status}"
+      exit $? ;;
     webcheck) check_web_routes; exit $? ;;
     logs) show_recent_logs; exit 0 ;;
     restart) restart_all; exit 0 ;;
@@ -196,7 +242,7 @@ while [[ $# -gt 0 ]]; do
         *) echo "Usage: $0 {status|protocols|cert|domain|webcheck|logs|restart|adblock {status|on|off}}"; exit 1 ;;
       esac
       exit $? ;;
-    *) echo "Usage: $0 {status|protocols|cert|domain|webcheck|logs|restart|adblock {status|on|off}}"; exit 1 ;;
+    *) echo "Usage: $0 {status|protocols|cert|domain|webcheck|logs|restart|adblock {status|on|off}|maintenance {status|internet-on|internet-off}}"; exit 1 ;;
   esac
 done
 
@@ -212,6 +258,9 @@ VPN Management Console
 8) Check frontend and API routes
 9) Show recent service logs
 10) Domain and TLS setup guide
+11) Maintenance forwarding status
+12) Pause WireGuard/OpenVPN internet forwarding
+13) Resume WireGuard/OpenVPN internet forwarding
 0) Exit
 MENU
 
@@ -232,6 +281,12 @@ while true; do
     8) check_web_routes ;;
     9) show_recent_logs ;;
     10) show_domain_guide ;;
+    11) manage_maintenance_internet status ;;
+    12)
+      read -r -p 'Pause IPv4 internet forwarding for WireGuard/OpenVPN clients? [y/N]: ' confirm
+      [[ "$confirm" == [yY] ]] && manage_maintenance_internet internet-on || echo "Pause cancelled."
+      ;;
+    13) manage_maintenance_internet internet-off ;;
     0) exit 0 ;;
     *) echo "Invalid option" ;;
   esac

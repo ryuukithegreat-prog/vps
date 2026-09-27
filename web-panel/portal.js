@@ -156,7 +156,10 @@ async function restorePortalSession() {
     const session = await request('/api/portal/session', { csrf: false });
     const maintenance = session.maintenance;
     byId('maintenanceBanner').hidden = maintenance?.enabled !== true;
-    byId('maintenanceBannerMessage').textContent = maintenance?.message || 'Some services may be temporarily unavailable.';
+    const maintenanceMessage = maintenance?.message || 'Some services may be temporarily unavailable.';
+    byId('maintenanceBannerMessage').textContent = maintenance?.blockInternet
+      ? `${maintenanceMessage} Internet forwarding is paused for WireGuard/OpenVPN clients; their VPN tunnels remain connected.`
+      : maintenanceMessage;
     if (!session.authenticated) {
       showLogin();
       return;

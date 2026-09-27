@@ -182,19 +182,40 @@ class AdminApiTests(unittest.TestCase):
         )
         _, session, _ = self.request("GET", "/api/session", cookie=cookie)
 
-        status, data, _ = self.request(
-            "POST",
-            "/api/maintenance",
-            {"enabled": True, "message": "Planned network maintenance."},
-            cookie=cookie,
-            csrf=session["csrfToken"],
-        )
+        with patch.object(admin_api, "set_vpn_forwarding_block") as firewall:
+            status, data, _ = self.request(
+                "POST",
+                "/api/maintenance",
+                {"enabled": True, "message": "Planned network maintenance.", "blockInternet": True},
+                cookie=cookie,
+                csrf=session["csrfToken"],
+            )
+            firewall.assert_called_once_with(True)
         self.assertEqual(status, 200)
-        self.assertEqual(data["maintenance"], {"enabled": True, "message": "Planned network maintenance."})
+        self.assertEqual(
+            data["maintenance"],
+            {"enabled": True, "message": "Planned network maintenance.", "blockInternet": True},
+        )
+
+        with patch.object(
+            admin_api,
+            "set_vpn_forwarding_block",
+            side_effect=[RuntimeError("firewall unavailable"), None],
+        ) as firewall:
+            with self.assertRaisesRegex(RuntimeError, "firewall unavailable"):
+                admin_api.set_maintenance_state(False, "", False)
+            self.assertEqual(firewall.call_count, 2)
+        self.assertEqual(
+            admin_api.read_maintenance_state(),
+            {"enabled": True, "message": "Planned network maintenance.", "blockInternet": True},
+        )
 
         status, data, _ = self.request("GET", "/api/portal/session")
         self.assertEqual(status, 200)
-        self.assertEqual(data["maintenance"], {"enabled": True, "message": "Planned network maintenance."})
+        self.assertEqual(
+            data["maintenance"],
+            {"enabled": True, "message": "Planned network maintenance.", "blockInternet": True},
+        )
 
         status, data, _ = self.request(
             "POST",
@@ -208,10 +229,43 @@ class AdminApiTests(unittest.TestCase):
         status, data, _ = self.request(
             "POST",
             "/api/maintenance",
+            {"enabled": False, "message": "", "blockInternet": True},
+            cookie=cookie,
+            csrf=session["csrfToken"],
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("Enable the client maintenance notice", data["error"])
+
+        status, data, _ = self.request(
+            "POST",
+            "/api/maintenance",
             {"enabled": False, "message": ""},
             cookie=cookie,
         )
         self.assertEqual(status, 403)
+
+    def test_vpn_forwarding_pause_calls_installed_helper_and_reports_failure(self):
+        with patch.object(
+            admin_api.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, "", ""),
+        ) as run:
+            admin_api.set_vpn_forwarding_block(True)
+            run.assert_called_once_with(
+                [admin_api.MAINTENANCE_FIREWALL_COMMAND, "enable"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+
+        with patch.object(
+            admin_api.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 1, "", "iptables failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "maintenance firewall"):
+                admin_api.set_vpn_forwarding_block(False)
 
     def test_vpn_endpoint_helpers_format_ipv6_authorities(self):
         with patch.dict(os.environ, {"DOMAIN": "2001:db8::10", "WG_PORT": "51820"}):
@@ -237,6 +291,7 @@ class AdminApiTests(unittest.TestCase):
             for payload in (
                 {"username": "field-device", "protocol": "unknown"},
                 {"username": "field-device", "password": "short"},
+                {"username": "field-device", "routeMode": "unrestricted"},
             ):
                 status, data, _ = self.request(
                     "POST", "/api/clients", payload, cookie=cookie, csrf=session["csrfToken"]
@@ -571,7 +626,7 @@ class AdminApiTests(unittest.TestCase):
             status, created, _ = self.request(
                 "POST",
                 "/api/clients",
-                {"username": " field-laptop ", "durationDays": 7},
+                {"username": " field-laptop ", "durationDays": 7, "routeMode": "split"},
                 cookie=cookie,
                 csrf=csrf,
             )
@@ -579,12 +634,13 @@ class AdminApiTests(unittest.TestCase):
             self.assertEqual(created["client"]["address"], "10.42.0.3")
             self.assertEqual(created["client"]["username"], "field-laptop")
             self.assertEqual(created["client"]["protocol"], "wireguard")
+            self.assertEqual(created["client"]["routeMode"], "split")
             self.assertTrue(created["client"]["temporaryPassword"])
             self.assertIn("PrivateKey = client-private", created["config"])
             self.assertIn("Endpoint = vpn.example.test:51820", created["config"])
             self.assertIn("DNS = 10.42.0.1", created["config"])
             self.assertIn("PublicKey = server-public", created["config"])
-            self.assertIn("AllowedIPs = 0.0.0.0/0", created["config"])
+            self.assertIn("AllowedIPs = 10.42.0.0/24", created["config"])
             self.assertIn("PublicKey = client-public", admin_api.WG_CONFIG_PATH.read_text(encoding="utf-8"))
 
             status, clients, _ = self.request("GET", "/api/clients", cookie=cookie)
@@ -593,8 +649,14 @@ class AdminApiTests(unittest.TestCase):
             self.assertEqual(clients["clients"][0]["status"], "connected")
             self.assertNotIn("private_key", clients["clients"][0])
             self.assertEqual(clients["clients"][0]["durationDays"], 7)
+            self.assertEqual(clients["clients"][0]["routeMode"], "split")
             self.assertEqual(clients["clients"][0]["bytesReceived"], 12500)
             self.assertEqual(clients["clients"][0]["bytesSent"], 8300)
+            status, downloaded_config, _ = self.request(
+                "GET", f"/api/clients/{created['client']['id']}/config", cookie=cookie
+            )
+            self.assertEqual(status, 200)
+            self.assertIn("AllowedIPs = 10.42.0.0/24", downloaded_config)
 
             status, portal_login, client_cookie = self.request(
                 "POST",

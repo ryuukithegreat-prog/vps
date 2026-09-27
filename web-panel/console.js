@@ -435,10 +435,15 @@ async function loadMaintenance() {
   const response = await api('/api/maintenance');
   byId('maintenanceEnabled').checked = response.maintenance.enabled;
   byId('maintenanceMessage').value = response.maintenance.message;
+  byId('maintenanceBlockInternet').checked = response.maintenance.blockInternet === true;
+  byId('maintenanceBlockInternet').dataset.saved = String(response.maintenance.blockInternet === true);
 }
 
 async function saveMaintenance() {
   const button = byId('saveMaintenanceButton');
+  const blockInternet = byId('maintenanceBlockInternet').checked;
+  if (blockInternet && byId('maintenanceBlockInternet').dataset.saved !== 'true'
+      && !window.confirm('This blocks forwarded internet traffic for WireGuard and OpenVPN clients. Their VPN tunnels remain connected. Continue?')) return;
   button.disabled = true;
   try {
     const response = await api('/api/maintenance', {
@@ -446,12 +451,16 @@ async function saveMaintenance() {
       body: {
         enabled: byId('maintenanceEnabled').checked,
         message: byId('maintenanceMessage').value,
+        blockInternet,
       },
     });
     byId('maintenanceEnabled').checked = response.maintenance.enabled;
     byId('maintenanceMessage').value = response.maintenance.message;
+    byId('maintenanceBlockInternet').checked = response.maintenance.blockInternet === true;
+    byId('maintenanceBlockInternet').dataset.saved = String(response.maintenance.blockInternet === true);
     setNotice('Client portal maintenance notice saved.');
   } catch (error) {
+    await loadMaintenance().catch(() => {});
     setNotice(error.message, true);
   } finally {
     button.disabled = state.requestPending;
@@ -735,6 +744,7 @@ function renderVPNClients(clients) {
     ];
     if (isWireGuard) {
       fields.push(
+        ['Routing', client.routeMode === 'split' ? 'Split tunnel · VPN subnet only' : 'Full tunnel · all IPv4'],
         ['Uploaded', formatBytes(client.bytesReceived)],
         ['Downloaded', formatBytes(client.bytesSent)],
         ['Last handshake', relativeClientTime(client.lastHandshake)],
@@ -996,6 +1006,9 @@ byId('retryButton').addEventListener('click', refreshStatus);
 byId('adblockToggle').addEventListener('click', toggleAdblock);
 byId('saveAdblockSettingsButton').addEventListener('click', saveAdblockSettings);
 byId('saveMaintenanceButton').addEventListener('click', saveMaintenance);
+byId('maintenanceBlockInternet').addEventListener('change', () => {
+  if (byId('maintenanceBlockInternet').checked) byId('maintenanceEnabled').checked = true;
+});
 byId('buildDomainCommand').addEventListener('click', buildDomainSetupCommand);
 byId('copyDomainCommand').addEventListener('click', copyDomainSetupCommand);
 byId('refreshRate').addEventListener('change', configureRefresh);
