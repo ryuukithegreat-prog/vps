@@ -367,14 +367,14 @@ function renderAdblock(stateData) {
   byId('blockedDomains').value = (stateData?.blockedDomains || []).join('\n');
   byId('adblockStatus').textContent = enabled ? 'On' : 'Off';
   byId('adblockSummary').textContent = enabled
-    ? `VPN clients only · ${count.toLocaleString()} blocked hosts · ${stateData?.blockedDomains?.length || 0} custom domains`
+    ? `WireGuard/OpenVPN DNS · ${count.toLocaleString()} suffix rules · ${stateData?.blockedDomains?.length || 0} custom domains`
     : 'VPN clients only · filtered resolver is off';
   byId('adblockDetails').textContent = stateData?.lastError
     ? `Last update error: ${stateData.lastError}`
     : stateData?.updatedAt
-      ? `Updated ${formatTime(stateData.updatedAt)} · ${stateData.source || 'managed hosts list'}`
+      ? `Updated ${formatTime(stateData.updatedAt)} · ${stateData.source || 'managed blocklist'}`
       : 'Waiting for resolver status';
-  toggle.textContent = enabled ? 'Disable' : 'Enable';
+  toggle.textContent = enabled ? 'Pause DNS filtering' : 'Enable DNS filtering';
   toggle.setAttribute('aria-pressed', String(enabled));
   toggle.disabled = state.requestPending;
   byId('saveAdblockSettingsButton').disabled = state.requestPending;
@@ -422,7 +422,7 @@ async function saveAdblockSettings() {
       },
     });
     renderAdblock(response.adblock);
-    setNotice('DNS filtering settings saved.');
+    setNotice('DNS block rules saved.');
   } catch (error) {
     setNotice(error.message, true);
     await loadAdblock();
@@ -737,8 +737,9 @@ function renderVPNClients(clients) {
     const details = document.createElement('dl');
     details.className = 'client-details';
     const fields = [
-      ['Protocol / address', `${protocolLabel(client.protocol)} · ${client.address}`],
-      ['Server endpoint', client.endpoint || 'No endpoint observed'],
+      ['Protocol', protocolLabel(client.protocol)],
+      ['Assigned VPN IP', client.address],
+      ['Client remote endpoint', client.endpoint || 'No endpoint observed'],
       ['Account age', formatDuration(client.ageSeconds)],
       ['Access remaining', client.remainingSeconds === null ? 'No expiry' : formatDuration(client.remainingSeconds)],
     ];

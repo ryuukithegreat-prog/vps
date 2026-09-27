@@ -52,9 +52,11 @@ done
 check_shell_syntax setup-vpn-stack.sh
 check_shell_syntax vpn-admin.sh
 check_shell_syntax vpn-maintenance-firewall.sh
+check_shell_syntax vpn-dns-redirect.sh
 check_shell_syntax verify-vpn-stack.sh
 check_shell_syntax deploy.sh
-if python3 -c 'import ast,pathlib; [ast.parse(pathlib.Path(path).read_text(), filename=path) for path in ("vpn-status.py", "admin-api.py")]'; then
+check_file vpn-adblock-rules.py
+if python3 -c 'import ast,pathlib; [ast.parse(pathlib.Path(path).read_text(), filename=path) for path in ("vpn-status.py", "admin-api.py", "vpn-adblock-rules.py")]'; then
   pass "VPN Python services compile"
 else
   fail "VPN Python services have syntax errors"
@@ -91,6 +93,7 @@ check_file web-panel/portal.html
 check_file web-panel/portal.js
 check_file web-panel/portal.css
 check_file vpn-maintenance-firewall.sh
+check_file vpn-dns-redirect.sh
 grep -q 'try_files /portal.html =404' setup-vpn-stack.sh \
   && pass 'domain root serves the client portal' \
   || fail 'client portal root route is missing'
@@ -109,6 +112,15 @@ grep -q 'name="password"' web-panel/index.html \
 grep -q 'DEFAULT_UDPGW_PORT=7300' setup-vpn-stack.sh \
   && pass 'UDPGW port is explicitly named' \
   || fail 'UDPGW port declaration is missing'
+grep -q 'https://small.oisd.nl/' setup-vpn-stack.sh \
+  && pass 'OISD Small ad-block feed is configured' \
+  || fail 'OISD Small ad-block feed is missing'
+grep -q 'https://big.oisd.nl/' setup-vpn-stack.sh \
+  && pass 'OISD Big ad-block feed is configured' \
+  || fail 'OISD Big ad-block feed is missing'
+grep -q 'logrotate.d/vpnfront-dns-queries' setup-vpn-stack.sh \
+  && pass 'DNS query logs have a bounded retention policy' \
+  || fail 'DNS query log rotation is missing'
 
 if [[ ${RUN_HOST_CHECKS:-0} == 1 ]]; then
   check_file /etc/nginx/conf.d/vpn_frontend.conf

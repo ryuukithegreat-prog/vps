@@ -158,7 +158,7 @@ install_packages() {
   run_step "Updating package index" apt-get update
   run_step "Installing Debian 12 packages" apt-get install -y \
     curl ca-certificates gnupg lsb-release openssl jq net-tools ufw nginx \
-    certbot python3-certbot-nginx wireguard-tools openvpn strongswan dnsmasq \
+    certbot python3-certbot-nginx wireguard-tools openvpn strongswan dnsmasq logrotate \
     dnsutils iproute2 whois easy-rsa python3 python3-venv whiptail
 }
 
@@ -195,6 +195,8 @@ configure_ufw() {
     ufw route allow in on tun0 out on ${outbound_interface} from 10.8.0.0/24
     ufw allow in on wg0 to 10.42.0.1 port 53 proto udp comment "VPN DNS"
     ufw allow in on wg0 to 10.42.0.1 port 53 proto tcp comment "VPN DNS"
+    ufw allow in on tun0 to 10.8.0.1 port 53 proto udp comment "OpenVPN DNS"
+    ufw allow in on tun0 to 10.8.0.1 port 53 proto tcp comment "OpenVPN DNS"
     ${udpgw_rule}
     ufw --force enable
   "
@@ -397,7 +399,7 @@ RestartSec=3
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
-ReadWritePaths=/var/lib/vpnfront /etc/wireguard /etc/dnsmasq.d
+ReadWritePaths=/var/lib/vpnfront /var/log/vpnfront /etc/wireguard /etc/dnsmasq.d
 
 [Install]
 WantedBy=multi-user.target
@@ -647,21 +649,61 @@ EOF
 }
 
 configure_dns_filter() {
+  install -o root -g root -m 0755 "$SCRIPT_DIR/vpn-adblock-rules.py" /usr/local/bin/vpn-adblock-rules
+  install -o root -g root -m 0755 "$SCRIPT_DIR/vpn-dns-redirect.sh" /usr/local/sbin/vpn-dns-redirect
   mkdir -p /etc/dnsmasq.d /etc/systemd/system/dnsmasq.service.d /var/lib/vpnfront
+  install -d -o dnsmasq -g adm -m 0750 /var/log/vpnfront
+  install -o dnsmasq -g adm -m 0640 /dev/null /var/log/vpnfront/dns-queries.log
+  cat > /etc/logrotate.d/vpnfront-dns-queries <<'EOF'
+/var/log/vpnfront/dns-queries.log {
+  daily
+  rotate 7
+  maxsize 50M
+  missingok
+  notifempty
+  compress
+  delaycompress
+  su dnsmasq adm
+  create 0640 dnsmasq adm
+  sharedscripts
+  postrotate
+    systemctl reload dnsmasq >/dev/null 2>&1 || true
+  endscript
+}
+EOF
+  chmod 0644 /etc/logrotate.d/vpnfront-dns-queries
+  cat > /etc/systemd/system/vpn-dns-redirect.service <<'EOF'
+[Unit]
+Description=Redirect standard VPN DNS requests to the filtered resolver
+After=ufw.service network-pre.target
+Wants=ufw.service
+Before=dnsmasq.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/vpn-dns-redirect enable
+ExecStop=/usr/local/sbin/vpn-dns-redirect disable
+
+[Install]
+WantedBy=multi-user.target
+EOF
   if [[ ! -f /var/lib/vpnfront/maintenance.json ]]; then
     printf '{"enabled":false,"message":"","block_internet":false}\n' >/var/lib/vpnfront/maintenance.json
   fi
   chmod 600 /var/lib/vpnfront/maintenance.json
   touch /var/lib/vpnfront/ads-source.hosts /var/lib/vpnfront/ads.hosts
   chmod 644 /var/lib/vpnfront/ads-source.hosts /var/lib/vpnfront/ads.hosts
+  touch /var/lib/vpnfront/adblock-dnsmasq.conf
+  chmod 644 /var/lib/vpnfront/adblock-dnsmasq.conf
   if [[ ! -f /var/lib/vpnfront/adblock.json ]]; then
     printf '{"enabled":false,"host_count":0,"updated_at":null,"last_error":null}\n' >/var/lib/vpnfront/adblock.json
   fi
   chmod 600 /var/lib/vpnfront/adblock.json
   cat > /etc/dnsmasq.d/vpnfront.conf <<'EOF'
-interface=wg0
-listen-address=10.42.0.1
-bind-interfaces
+interface=wg0,tun0
+listen-address=10.42.0.1,10.8.0.1
+bind-dynamic
 no-resolv
 server=1.1.1.1
 server=9.9.9.9
@@ -669,13 +711,16 @@ cache-size=10000
 domain-needed
 bogus-priv
 EOF
+  touch /etc/dnsmasq.d/vpnfront-adblock.conf
+  if [[ -f /etc/dnsmasq.d/vpnfront-adblock.conf ]] && ! grep -q '^conf-file=/var/lib/vpnfront/adblock-dnsmasq.conf$' /etc/dnsmasq.d/vpnfront-adblock.conf && [[ "$(jq -r '.enabled // false' /var/lib/vpnfront/adblock.json 2>/dev/null || printf false)" == true ]]; then
+    printf 'conf-file=/var/lib/vpnfront/adblock-dnsmasq.conf\n' >/etc/dnsmasq.d/vpnfront-adblock.conf
+  fi
   cat > /usr/local/bin/vpn-adblock-update <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
 STATE=/var/lib/vpnfront/adblock.json
-HOSTS=/var/lib/vpnfront/ads.hosts
-SOURCE=https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts
+RULES=/var/lib/vpnfront/adblock-dnsmasq.conf
 
 if [[ ! -f "$STATE" ]] || [[ "$(jq -r '.enabled // false' "$STATE")" != "true" ]]; then
   exit 0
@@ -693,13 +738,13 @@ record_error() {
 
 case "$(jq -r '.level // "balanced"' "$STATE")" in
   light)
-    SOURCE=https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts
+    SOURCES=(https://small.oisd.nl/)
     ;;
   balanced)
-    SOURCE=https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/fakenews-gambling/hosts
+    SOURCES=(https://big.oisd.nl/)
     ;;
   strict)
-    SOURCE=https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/fakenews-gambling-porn/hosts
+    SOURCES=(https://big.oisd.nl/ https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/fakenews-gambling-porn/hosts)
     ;;
   *)
     record_error
@@ -707,38 +752,25 @@ case "$(jq -r '.level // "balanced"' "$STATE")" in
     ;;
 esac
 
-raw="$(mktemp /var/lib/vpnfront/adblock-raw.XXXXXX)"
-candidate="$(mktemp /var/lib/vpnfront/ads-candidate.XXXXXX)"
-backup="$(mktemp /var/lib/vpnfront/ads-backup.XXXXXX)"
-trap 'rm -f "$raw" "$candidate" "$backup"' EXIT
+candidate="$(mktemp /var/lib/vpnfront/adblock-candidate.XXXXXX)"
+backup="$(mktemp /var/lib/vpnfront/adblock-backup.XXXXXX)"
+trap 'rm -f "$candidate" "$backup" "${raw:-}"' EXIT
 
-if ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --max-time 90 "$SOURCE" -o "$raw"; then
-  record_error
-  exit 1
-fi
+for SOURCE in "${SOURCES[@]}"; do
+  raw="$(mktemp /var/lib/vpnfront/adblock-raw.XXXXXX)"
+  if ! curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --max-time 90 "$SOURCE" -o "$raw"; then
+    record_error
+    exit 1
+  fi
+  if ! /usr/local/bin/vpn-adblock-rules "$raw" >>"$candidate"; then
+    record_error
+    exit 1
+  fi
+  rm -f "$raw"
+  raw=""
+done
 
-if ! awk '
-  $1 == "0.0.0.0" || $1 == "127.0.0.1" {
-    for (i = 2; i <= NF; i++) {
-      host = tolower($i)
-      if (host ~ /^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/ && host !~ /\.\./ && host !~ /\.$/ && host !~ /\.local$/ && host != "localhost" && host != "broadcasthost") {
-        print "0.0.0.0 " host
-      }
-    }
-  }
-' "$raw" | sort -u >"$candidate"; then
-  record_error
-  exit 1
-fi
-
-jq -r '.blocked_domains[]? | select(type == "string")' "$STATE" | awk '
-  {
-    host = tolower($0)
-    if (length(host) <= 253 && host ~ /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/) {
-      print "0.0.0.0 " host
-    }
-  }
-' >>"$candidate"
+jq -r '.blocked_domains[]? | select(type == "string")' "$STATE" | /usr/local/bin/vpn-adblock-rules >>"$candidate"
 sort -u "$candidate" -o "$candidate"
 
 host_count="$(wc -l <"$candidate")"
@@ -747,11 +779,11 @@ if (( host_count < 100 || host_count > 2000000 )); then
   exit 1
 fi
 
-cp -p "$HOSTS" "$backup"
+cp -p "$RULES" "$backup"
 chmod 644 "$candidate"
-mv "$candidate" "$HOSTS"
+mv "$candidate" "$RULES"
 if ! dnsmasq --test >/dev/null 2>&1 || ! systemctl reload dnsmasq; then
-  mv "$backup" "$HOSTS"
+  mv "$backup" "$RULES"
   systemctl reload dnsmasq >/dev/null 2>&1 || true
   record_error
   exit 1
@@ -794,6 +826,7 @@ Unit=vpn-adblock-update.service
 WantedBy=timers.target
 EOF
   systemctl daemon-reload
+  systemctl enable --now vpn-dns-redirect.service || warn "Standard DNS redirection could not be enabled."
   systemctl enable --now dnsmasq || warn "The VPN-only DNS resolver could not be started."
   systemctl enable --now vpn-adblock-update.timer || warn "The ad-block list update timer could not be enabled."
 }
@@ -869,8 +902,7 @@ data-ciphers AES-256-GCM:AES-128-GCM
 auth SHA256
 server 10.8.0.0 255.255.255.0
 push "redirect-gateway def1 bypass-dhcp"
-push "dhcp-option DNS 1.1.1.1"
-push "dhcp-option DNS 9.9.9.9"
+push "dhcp-option DNS 10.8.0.1"
 keepalive 10 120
 persist-key
 persist-tun

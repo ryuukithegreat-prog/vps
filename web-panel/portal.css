@@ -35,6 +35,8 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 .portal-topbar { min-height: 68px; display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 0 max(24px, calc((100vw - 1120px) / 2)); background: var(--pine); color: #f2f6f2; }
 .maintenance-banner { width: min(1120px, calc(100% - 48px)); display: flex; gap: 12px; margin: 18px auto -22px; padding: 12px 14px; border-left: 3px solid #bd5947; background: #fff1ed; color: #713728; font-size: 12px; line-height: 1.5; }
 .maintenance-banner strong { flex: 0 0 auto; }
+.privacy-banner { width: min(1120px, calc(100% - 48px)); margin: 18px auto -22px; padding: 10px 14px; border-left: 3px solid var(--teal); background: #edf7f3; color: #31574d; font-size: 10px; line-height: 1.55; }
+.maintenance-banner + .privacy-banner { margin-top: 30px; }
 .portal-brand { display: flex; align-items: center; gap: 11px; color: inherit; text-decoration: none; }
 .portal-mark { width: 37px; height: 37px; display: grid; place-items: center; background: var(--lime); color: #1a2b23; }
 .portal-mark svg { width: 21px; height: 21px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
@@ -137,6 +139,7 @@ button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid 
 @media (max-width: 640px) {
   .portal-topbar { min-height: 60px; padding: 0 16px; }
   .maintenance-banner { width: calc(100% - 28px); flex-direction: column; gap: 3px; margin-bottom: -8px; }
+  .privacy-banner { width: calc(100% - 28px); margin-bottom: -8px; }
   .portal-tools { gap: 10px; }
   .portal-host { display: none; }
   .portal-main { width: min(100% - 28px, 520px); padding-top: 22px; }

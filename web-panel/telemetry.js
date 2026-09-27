@@ -6,6 +6,7 @@
   'use strict';
 
   const POLL_MS = 3000;
+  const DNS_POLL_MS = 15000;
   const HISTORY_LEN = 30;
 
   // State
@@ -25,6 +26,10 @@ const state = {
     logs: [],
     connections: [],
     banned: [],
+    dnsQueries: [],
+    dnsLoggingEnabled: false,
+    dnsScope: '',
+    lastDnsPoll: 0,
     cpuHist: [],
     memHist: [],
     netRxHist: [],
@@ -114,6 +119,67 @@ const state = {
     finally { state.inflight.banned = false; }
   }
 
+  async function pollDnsQueries() {
+    if (state.inflight.dns || Date.now() - state.lastDnsPoll < DNS_POLL_MS) return;
+    state.inflight.dns = true;
+    state.lastDnsPoll = Date.now();
+    try {
+      const result = await fetchJSON('/api/telemetry/dns');
+      state.dnsQueries = result.queries || [];
+      state.dnsLoggingEnabled = result.enabled === true;
+      state.dnsScope = result.scope || '';
+      renderDnsQueries(result.retentionDays || 7);
+    } catch {}
+    finally { state.inflight.dns = false; }
+  }
+
+  function renderDnsQueries(retentionDays) {
+    const list = document.getElementById('tDnsQueries');
+    const toggle = document.getElementById('tDnsToggle');
+    const scope = document.getElementById('tDnsScope');
+    if (!list || !toggle || !scope) return;
+    toggle.textContent = state.dnsLoggingEnabled ? 'Pause DNS query logging' : 'Enable DNS query logging';
+    toggle.setAttribute('aria-pressed', String(state.dnsLoggingEnabled));
+    scope.textContent = state.dnsLoggingEnabled
+      ? `${state.dnsScope} Recent queries; logs are retained for up to ${retentionDays} days.`
+      : 'Logging is off. Enabling records WireGuard/OpenVPN DNS query names and assigned tunnel IPs; this is not complete browsing history.';
+    if (!state.dnsQueries.length) {
+      list.innerHTML = `<p class="t-empty">${state.dnsLoggingEnabled ? 'No DNS queries recorded yet.' : 'Enable query logging to collect DNS activity.'}</p>`;
+      return;
+    }
+    list.innerHTML = state.dnsQueries.map((query) => `
+      <div class="t-dns-row">
+        <time>${esc(query.time || '—')}</time>
+        <strong>${esc(query.client || 'Unknown VPN client')}</strong>
+        <code>${esc(query.clientIp || '—')}</code>
+        <code>${esc(query.domain || '—')}</code>
+        <span>${esc(query.type || '')}</span>
+      </div>
+    `).join('');
+  }
+
+  async function toggleDnsQueryLogging() {
+    const enabled = !state.dnsLoggingEnabled;
+    if (enabled && !confirm('DNS query names and assigned WireGuard/OpenVPN tunnel IPs will be logged. Clients see a notice, and logs rotate after 7 days. Continue?')) return;
+    try {
+      if (typeof api === 'function') {
+        await api('/api/telemetry/dns', { method: 'POST', body: { enabled } });
+      } else {
+        const response = await fetch('/api/telemetry/dns', {
+          method: 'POST', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enabled }),
+        });
+        if (!response.ok) throw new Error(`Request failed (${response.status}).`);
+      }
+      state.lastDnsPoll = 0;
+      await pollDnsQueries();
+      if (window.toast) window.toast(`DNS query logging ${enabled ? 'enabled' : 'paused'}.`, 'success');
+    } catch (error) {
+      if (window.toast) window.toast(`DNS logging update failed: ${error.message}`, 'error');
+    }
+  }
+
   // ---- Sparkline ----
   function sparkline(values, color, max) {
     if (!values.length) return '';
@@ -164,9 +230,11 @@ const state = {
       const dot = c.active ? '<span class="t-dot t-dot-on"></span>' : '<span class="t-dot t-dot-off"></span>';
       const ipStr = String(c.ip || '');
       const isPrivate = /^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|127\.|169\.254\.|::1|fc|fd)/i.test(ipStr);
-      const isSelf = c.self === true || (window.__mySSHIPs || []).includes(String(c.ip).trim());
+      const selfIps = [window.__mySSHIP, ...(window.__mySSHIPs || [])].filter(Boolean);
+      const isSelf = c.self === true || selfIps.includes(String(c.ip).trim());
+      const remoteAddress = c.remoteEndpoint || (c.proto === 'wireguard' && c.tunnelIp === c.ip ? 'Not observed' : c.ip || '—');
       const banBtn = (c.ip && !isPrivate && !isSelf)
-        ? `<button class="t-btn t-btn-danger" data-ban="${esc(c.ip)}">Ban</button>`
+        ? `<button class="t-btn t-btn-danger" data-ban="${esc(c.ip)}">Block remote IP</button>`
         : (isSelf ? '<span class="t-muted" style="font-size:.625rem;">you</span>' : '');
       const traffic = (c.rx || c.tx)
         ? `<span class="t-card-traffic">${fmtBytes(c.rx)} ↓ · ${fmtBytes(c.tx)} ↑</span>`
@@ -178,7 +246,8 @@ const state = {
           ${banBtn}
         </div>
         <div class="t-conn-meta">
-          <code>${esc(c.ip || '—')}</code>
+          <span>Remote endpoint <code>${esc(remoteAddress)}</code></span>
+          <span>VPN IP <code>${esc(c.tunnelIp || '—')}</code></span>
           ${since ? `<span class="t-muted">since ${esc(since)}</span>` : ''}
           ${traffic}
         </div>
@@ -276,12 +345,7 @@ const state = {
   // ---- Injection ----
   let injected = false;
   function findSecurityView() {
-    // Existing security page has .security-list
-    const sl = document.querySelector('.security-list');
-    if (!sl) return null;
-    // Make sure it's visible
-    const section = sl.closest('section, .section-block, main > div, [data-view="security"]');
-    return section || sl.parentElement;
+    return document.getElementById('view-security');
   }
 
   function inject() {
@@ -299,6 +363,11 @@ const state = {
       <section class="t-block">
         <div class="t-head"><h3>Active connections</h3><span class="t-muted" id="tConnCount"></span></div>
         <div id="tConnections" class="t-inner"></div>
+      </section>
+      <section class="t-block">
+        <div class="t-head"><h3>DNS queries observed</h3><button class="t-btn" id="tDnsToggle" type="button" aria-pressed="false">Enable DNS query logging</button></div>
+        <p class="t-muted t-dns-scope" id="tDnsScope"></p>
+        <div id="tDnsQueries" class="t-inner t-dns-queries"></div>
       </section>
       <section class="t-block">
         <div class="t-head">
@@ -326,7 +395,7 @@ const state = {
         <div id="tBanned" class="t-inner"></div>
       </section>
     `;
-    view.parentElement.insertBefore(wrap, view.nextSibling);
+    view.appendChild(wrap);
     injected = true;
 
     // Filter events
@@ -341,6 +410,7 @@ const state = {
     wrap.addEventListener('click', (e) => {
       const b = e.target.closest('[data-ban]');
       if (b) return banIP(b.dataset.ban);
+      if (e.target.closest('#tDnsToggle')) return toggleDnsQueryLogging();
       const u = e.target.closest('[data-unban]');
       if (u) return unbanIP(u.dataset.unban);
     });
@@ -349,8 +419,8 @@ const state = {
   // ---- Poll loop ----
   function tick() {
     if (document.hidden) return;
-    if (!document.querySelector('.security-list')) {
-      // Security not visible — remove our injection
+    const securityView = findSecurityView();
+    if (!securityView || securityView.hidden) {
       const w = document.getElementById('telemetryWrap');
       if (w) w.remove();
       injected = false;
@@ -361,6 +431,7 @@ const state = {
     pollConnections();
     pollLogs();
     pollBanned();
+    pollDnsQueries();
   }
 
   setInterval(tick, POLL_MS);

@@ -390,6 +390,17 @@ nav .nav-button {
   color: #0a3a2a;
 }
 #telemetryWrap .t-card-traffic { color: #667; font-size: .6875rem; }
+#telemetryWrap .t-dns-scope { margin: 0 0 10px; font-size: .6875rem; line-height: 1.45; }
+#telemetryWrap .t-dns-queries { max-height: 420px; overflow: auto; }
+#telemetryWrap .t-dns-row { display: grid; grid-template-columns: 100px minmax(110px, 1fr) minmax(100px, .8fr) minmax(140px, 1.4fr) 44px; gap: 8px; align-items: baseline; padding: 7px 4px; border-bottom: 1px solid var(--line, #e6ebe8); font-size: .6875rem; }
+#telemetryWrap .t-dns-row > * { min-width: 0; overflow-wrap: anywhere; }
+#telemetryWrap .t-dns-row time, #telemetryWrap .t-dns-row code { font-family: "IBM Plex Mono", ui-monospace, monospace; }
+#telemetryWrap .t-dns-row strong { color: #0a3a2a; font-weight: 600; }
+@media (max-width: 640px) {
+  #telemetryWrap .t-dns-row { grid-template-columns: minmax(88px, .8fr) minmax(0, 1.2fr); gap: 4px 8px; }
+  #telemetryWrap .t-dns-row > *:nth-child(n + 3) { grid-column: 2; }
+  #telemetryWrap .t-dns-row > *:nth-child(2) { grid-row: 1 / span 2; grid-column: 2; }
+}
 
 /* ==== Log — hard constrain, wrap cleanly ==== */
 #telemetryWrap .t-logs {

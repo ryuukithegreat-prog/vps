@@ -167,7 +167,7 @@ toggle_adblock() {
 
   case "$choice" in
     on)
-      printf 'addn-hosts=/var/lib/vpnfront/ads.hosts\n' >"$config_tmp"
+      printf 'conf-file=/var/lib/vpnfront/adblock-dnsmasq.conf\n' >"$config_tmp"
       chmod 600 "$config_tmp"
       mv "$config_tmp" "$config"
       ;;

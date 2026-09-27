@@ -39,23 +39,28 @@ WG_CONFIG_PATH = Path(os.environ.get("WG_CONFIG_PATH", "/etc/wireguard/wg0.conf"
 ADBLOCK_CONFIG_PATH = Path(os.environ.get("ADBLOCK_CONFIG_PATH", "/etc/dnsmasq.d/vpnfront-adblock.conf"))
 ADBLOCK_HOSTS_PATH = Path(os.environ.get("ADBLOCK_HOSTS_PATH", "/var/lib/vpnfront/ads.hosts"))
 ADBLOCK_STATE_PATH = Path(os.environ.get("ADBLOCK_STATE_PATH", "/var/lib/vpnfront/adblock.json"))
+DNS_QUERY_LOG_PATH = Path(os.environ.get("DNS_QUERY_LOG_PATH", "/var/log/vpnfront/dns-queries.log"))
+DNS_QUERY_LOG_CONFIG_PATH = Path(os.environ.get("DNS_QUERY_LOG_CONFIG_PATH", "/etc/dnsmasq.d/vpnfront-dns-logging.conf"))
+OPENVPN_STATUS_PATH = Path(os.environ.get("OPENVPN_STATUS_PATH", "/var/log/openvpn-status.log"))
 MAINTENANCE_STATE_PATH = Path(os.environ.get("MAINTENANCE_STATE_PATH", "/var/lib/vpnfront/maintenance.json"))
 MAINTENANCE_FIREWALL_COMMAND = os.environ.get(
     "MAINTENANCE_FIREWALL_COMMAND", "/usr/local/sbin/vpn-maintenance-firewall"
 )
-ADBLOCK_SOURCE_URL = "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
 ADBLOCK_LEVELS = {
     "light": {
-        "label": "Light",
-        "url": ADBLOCK_SOURCE_URL,
+        "label": "Easy · OISD Small",
+        "urls": ["https://small.oisd.nl/"],
     },
     "balanced": {
-        "label": "Balanced",
-        "url": "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/fakenews-gambling/hosts",
+        "label": "Balanced · OISD Big",
+        "urls": ["https://big.oisd.nl/"],
     },
     "strict": {
-        "label": "Strict",
-        "url": "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/fakenews-gambling-porn/hosts",
+        "label": "Hard · OISD Big + StevenBlack extras",
+        "urls": [
+            "https://big.oisd.nl/",
+            "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/fakenews-gambling-porn/hosts",
+        ],
     },
 }
 BLOCKED_DOMAIN_PATTERN = re.compile(
@@ -452,8 +457,12 @@ def read_adblock_state():
     if not isinstance(state, dict):
         state = {}
     level = state.get("level", "balanced")
-    if level not in ADBLOCK_LEVELS:
+    if not isinstance(level, str) or level not in ADBLOCK_LEVELS:
         level = "balanced"
+    try:
+        host_count = max(0, int(state.get("host_count", 0) or 0))
+    except (TypeError, ValueError, OverflowError):
+        host_count = 0
     blocked_domains = state.get("blocked_domains", [])
     if not isinstance(blocked_domains, list):
         blocked_domains = []
@@ -464,13 +473,13 @@ def read_adblock_state():
     ][:MAX_BLOCKED_DOMAINS]
     return {
         "enabled": state.get("enabled") is True,
-        "hostCount": max(0, int(state.get("host_count", 0) or 0)),
+        "hostCount": host_count,
         "updatedAt": state.get("updated_at"),
         "lastError": state.get("last_error"),
         "level": level,
         "blockedDomains": blocked_domains,
-        "source": f"StevenBlack {ADBLOCK_LEVELS[level]['label']} hosts",
-        "sourceUrl": ADBLOCK_LEVELS[level]["url"],
+        "source": ADBLOCK_LEVELS[level]["label"],
+        "sourceUrl": ADBLOCK_LEVELS[level]["urls"],
     }
 
 
@@ -487,6 +496,109 @@ def validate_blocked_domains(domains):
         if domain not in normalized:
             normalized.append(domain)
     return normalized
+
+
+def dns_query_logging_enabled():
+    return DNS_QUERY_LOG_CONFIG_PATH.exists()
+
+
+def set_dns_query_logging(enabled):
+    if not isinstance(enabled, bool):
+        raise ValueError("DNS query logging must be enabled or disabled.")
+    previous = DNS_QUERY_LOG_CONFIG_PATH.read_bytes() if DNS_QUERY_LOG_CONFIG_PATH.exists() else None
+    expected_config = f"log-queries=extra\nlog-facility={DNS_QUERY_LOG_PATH}\n".encode("utf-8")
+    if (enabled and previous == expected_config) or (not enabled and previous is None):
+        return enabled
+    try:
+        if enabled:
+            DNS_QUERY_LOG_PATH.parent.mkdir(mode=0o750, parents=True, exist_ok=True)
+            DNS_QUERY_LOG_PATH.touch(mode=0o640, exist_ok=True)
+            os.chmod(DNS_QUERY_LOG_PATH, 0o640)
+            _atomic_private_write(
+                DNS_QUERY_LOG_CONFIG_PATH,
+                expected_config.decode("utf-8"),
+            )
+        else:
+            DNS_QUERY_LOG_CONFIG_PATH.unlink(missing_ok=True)
+        validation = subprocess.run(
+            ["dnsmasq", "--test"], capture_output=True, text=True, timeout=10, check=False
+        )
+        if validation.returncode != 0:
+            raise RuntimeError("dnsmasq rejected the DNS query logging configuration.")
+        reload_result = subprocess.run(
+            ["systemctl", "reload", "dnsmasq"], capture_output=True, text=True, timeout=15, check=False
+        )
+        if reload_result.returncode != 0:
+            raise RuntimeError("The VPN DNS resolver could not reload its configuration.")
+    except (OSError, RuntimeError, subprocess.TimeoutExpired):
+        if previous is None:
+            DNS_QUERY_LOG_CONFIG_PATH.unlink(missing_ok=True)
+        else:
+            _atomic_private_write(DNS_QUERY_LOG_CONFIG_PATH, previous.decode("utf-8"))
+        try:
+            subprocess.run(["systemctl", "reload", "dnsmasq"], capture_output=True, text=True, timeout=15, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            logger.exception("Failed to restore DNS query logging configuration")
+        raise
+    return enabled
+
+
+def read_dns_queries(limit=200):
+    limit = max(1, min(int(limit), 500))
+    lines = []
+    try:
+        with DNS_QUERY_LOG_PATH.open("rb") as log_file:
+            log_file.seek(0, os.SEEK_END)
+            end = log_file.tell()
+            log_file.seek(max(0, end - 1024 * 1024))
+            lines = log_file.read().decode("utf-8", errors="replace").splitlines()[-max(1000, limit * 5):]
+    except OSError:
+        return []
+
+    client_names = {}
+    try:
+        with database() as connection:
+            for row in connection.execute(
+                "SELECT username, address FROM vpn_clients WHERE COALESCE(protocol, 'wireguard') = 'wireguard'"
+            ):
+                address = (row["address"] or "").split("/", 1)[0]
+                if address:
+                    client_names[address] = row["username"]
+    except sqlite3.Error:
+        pass
+    try:
+        for line in OPENVPN_STATUS_PATH.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("ROUTING_TABLE"):
+                fields = line.split(",")
+                if len(fields) >= 3:
+                    client_names[fields[1]] = fields[2]
+    except OSError:
+        pass
+
+    pattern = re.compile(r"query\[([A-Z0-9]+)\]\s+([^\s]+)\s+from\s+([^\s/]+)")
+    queries = []
+    for line in reversed(lines):
+        match = pattern.search(line)
+        if not match:
+            continue
+        query_type, domain, client_ip = match.groups()
+        domain = domain.rstrip(".").lower()
+        try:
+            client_ip = str(ipaddress.ip_address(client_ip))
+        except ValueError:
+            continue
+        if not BLOCKED_DOMAIN_PATTERN.fullmatch(domain):
+            continue
+        queries.append({
+            "time": line[:15],
+            "clientIp": client_ip,
+            "client": client_names.get(client_ip, "Unknown VPN client"),
+            "type": query_type,
+            "domain": domain,
+        })
+        if len(queries) >= limit:
+            break
+    return queries
 
 
 def read_maintenance_state():
@@ -599,15 +711,18 @@ def set_adblock_enabled(enabled, level=None, blocked_domains=None):
     blocked_domains = validate_blocked_domains(blocked_domains)
     previous_config = ADBLOCK_CONFIG_PATH.read_bytes() if ADBLOCK_CONFIG_PATH.exists() else None
     previous_state = ADBLOCK_STATE_PATH.read_bytes() if ADBLOCK_STATE_PATH.exists() else None
+    expected_config = b"conf-file=/var/lib/vpnfront/adblock-dnsmasq.conf\n"
+    config_matches = previous_config == expected_config if enabled else previous_config is None
     if (
         current_state["enabled"] == enabled
         and current_state["level"] == level
         and current_state["blockedDomains"] == blocked_domains
+        and config_matches
     ):
         return current_state
     try:
         if enabled:
-            _atomic_private_write(ADBLOCK_CONFIG_PATH, f"addn-hosts={ADBLOCK_HOSTS_PATH}\n")
+            _atomic_private_write(ADBLOCK_CONFIG_PATH, "conf-file=/var/lib/vpnfront/adblock-dnsmasq.conf\n")
         else:
             ADBLOCK_CONFIG_PATH.unlink(missing_ok=True)
         _write_adblock_state(
@@ -1443,23 +1558,42 @@ def read_connections(caller_ip=None):
         for line in (r.stdout or "").splitlines()[1:]:
             parts = line.split("\t")
             if len(parts) >= 8:
-                pk = parts[0]; ip = parts[3]
+                pk = parts[0]; allowed_ips = parts[3]
                 hs = int(parts[4] or "0")
                 rx = int(parts[5] or "0"); tx = int(parts[6] or "0")
                 active = bool(hs and (now - hs) < 180)
-                ipaddr = ip.split("/")[0]
-                username = wg_users.get(ipaddr) or wg_users.get(pk) or (pk[:10] + "…")
-                conns.append({"proto":"wireguard","user":username,"ip":ipaddr,
+                tunnel_ip = allowed_ips.split(",", 1)[0].split("/")[0]
+                endpoint = parts[2] if parts[2] != "(none)" else None
+                try:
+                    remote_ip = str(ipaddress.ip_address(urlsplit(f"//{endpoint}").hostname)) if endpoint else None
+                except (TypeError, ValueError):
+                    remote_ip = None
+                username = wg_users.get(tunnel_ip) or wg_users.get(pk) or (pk[:10] + "…")
+                conns.append({"proto":"wireguard","user":username,"ip":remote_ip or tunnel_ip,
+                              "tunnelIp":tunnel_ip,"remoteEndpoint":endpoint,
                               "since":hs or None,"active":active,"rx":rx,"tx":tx})
     except (OSError, subprocess.TimeoutExpired, ValueError):
         pass
     try:
-        text = Path("/var/log/openvpn-status.log").read_text(errors="replace")
-        for line in text.splitlines():
+        text = OPENVPN_STATUS_PATH.read_text(errors="replace")
+        status_lines = text.splitlines()
+        tunnel_ips = {}
+        for line in status_lines:
+            if line.startswith("ROUTING_TABLE"):
+                columns = line.split(",")
+                if len(columns) >= 3:
+                    tunnel_ips[columns[2]] = columns[1]
+        for line in status_lines:
             if line.startswith("CLIENT_LIST"):
                 cols = line.split(",")
                 if len(cols) >= 8:
-                    conns.append({"proto":"openvpn","user":cols[1],"ip":cols[2].split(":")[0],
+                    real_address = cols[2]
+                    try:
+                        remote_ip = str(ipaddress.ip_address(urlsplit(f"//{real_address}").hostname))
+                    except (TypeError, ValueError):
+                        remote_ip = None
+                    conns.append({"proto":"openvpn","user":cols[1],"ip":remote_ip or tunnel_ips.get(cols[1]),
+                                  "tunnelIp":tunnel_ips.get(cols[1]),"remoteEndpoint":real_address,
                                   "since":cols[7] if len(cols) > 7 else None,
                                   "active":True,
                                   "rx":int(cols[5] or "0") if len(cols) > 5 else 0,
@@ -2199,8 +2333,12 @@ class AdminHandler(BaseHTTPRequestHandler):
         if path == "/api/portal/session":
             expire_wireguard_clients()
             session = self.get_client_session()
+            portal_state = {
+                "maintenance": read_maintenance_state(),
+                "dnsLoggingEnabled": dns_query_logging_enabled(),
+            }
             if session is None:
-                self.send_json(200, {"authenticated": False, "maintenance": read_maintenance_state()})
+                self.send_json(200, {"authenticated": False, **portal_state})
             else:
                 client_ip = self.headers.get("X-Real-IP") or self.client_address[0]
                 self.send_json(200, {
@@ -2209,7 +2347,7 @@ class AdminHandler(BaseHTTPRequestHandler):
                     "csrfToken": session["csrf_token"],
                     "mustChangePassword": session["must_change_password"],
                     "clientIp": client_ip,
-                    "maintenance": read_maintenance_state(),
+                    **portal_state,
                 })
             return
 
@@ -2249,7 +2387,11 @@ class AdminHandler(BaseHTTPRequestHandler):
             if session is None:
                 return
             try:
-                self.send_json(200, {"account": get_client_account(session["client_id"])})
+                self.send_json(200, {
+                    "account": get_client_account(session["client_id"]),
+                    "dnsLoggingEnabled": dns_query_logging_enabled(),
+                    "maintenance": read_maintenance_state(),
+                })
             except ExpiredClientError as exc:
                 self.send_json(410, {"error": str(exc)}, [self.clear_client_session_cookie()])
             except ValueError as exc:
@@ -2330,6 +2472,19 @@ class AdminHandler(BaseHTTPRequestHandler):
             try: self.send_json(200, {"logs": read_telemetry_logs()})
             except Exception: self.send_json(503, {"error": "logs unavailable"})
             return
+        if path == "/api/telemetry/dns":
+            if self.require_session() is None: return
+            try:
+                self.send_json(200, {
+                    "enabled": dns_query_logging_enabled(),
+                    "queries": read_dns_queries(),
+                    "retentionDays": 7,
+                    "scope": "WireGuard/OpenVPN DNS requests only; encrypted DNS and web page paths are not visible.",
+                })
+            except Exception:
+                self.send_json(503, {"error": "DNS query history unavailable."})
+            return
+
         if path == "/api/telemetry/connections":
             if self.require_session() is None: return
             try:
@@ -2454,6 +2609,19 @@ class AdminHandler(BaseHTTPRequestHandler):
 
         session = self.require_session()
         if session is None or not self.require_csrf(session):
+            return
+
+        if path == "/api/telemetry/dns":
+            try:
+                enabled = set_dns_query_logging(payload.get("enabled"))
+            except ValueError as exc:
+                self.send_json(400, {"error": str(exc)})
+                return
+            except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+                self.send_json(503, {"error": str(exc)})
+                return
+            logger.info("admin=%s action=dns_query_logging enabled=%s", session["username"], enabled)
+            self.send_json(200, {"enabled": enabled})
             return
 
         if path == "/api/firewall":

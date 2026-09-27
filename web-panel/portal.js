@@ -154,6 +154,7 @@ async function restorePortalSession() {
   { const __e = byId('portalHost'); if (__e) __e.textContent = location.host; }
   try {
     const session = await request('/api/portal/session', { csrf: false });
+    byId('dnsPrivacyNotice').hidden = session.dnsLoggingEnabled !== true;
     const maintenance = session.maintenance;
     byId('maintenanceBanner').hidden = maintenance?.enabled !== true;
     const maintenanceMessage = maintenance?.message || 'Some services may be temporarily unavailable.';
@@ -227,6 +228,12 @@ async function loadAccount() {
   state.requestPending = true;
   try {
     const response = await request('/api/portal/account');
+    byId('dnsPrivacyNotice').hidden = response.dnsLoggingEnabled !== true;
+    byId('maintenanceBanner').hidden = response.maintenance?.enabled !== true;
+    const maintenanceMessage = response.maintenance?.message || 'Some services may be temporarily unavailable.';
+    byId('maintenanceBannerMessage').textContent = response.maintenance?.blockInternet
+      ? `${maintenanceMessage} Internet forwarding is paused for WireGuard/OpenVPN clients; their VPN tunnels remain connected.`
+      : maintenanceMessage;
     renderAccount(response.account);
   } catch (error) {
     if (error.status === 410) {

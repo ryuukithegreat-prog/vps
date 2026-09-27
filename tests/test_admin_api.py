@@ -30,6 +30,9 @@ class AdminApiTests(unittest.TestCase):
         self.original_adblock_hosts_path = admin_api.ADBLOCK_HOSTS_PATH
         self.original_adblock_state_path = admin_api.ADBLOCK_STATE_PATH
         self.original_maintenance_state_path = admin_api.MAINTENANCE_STATE_PATH
+        self.original_dns_query_log_path = admin_api.DNS_QUERY_LOG_PATH
+        self.original_dns_query_log_config_path = admin_api.DNS_QUERY_LOG_CONFIG_PATH
+        self.original_openvpn_status_path = admin_api.OPENVPN_STATUS_PATH
         admin_api.DB_PATH = Path(self.temp_dir.name) / "admins.sqlite3"
         admin_api.STATUS_PATH = Path(self.temp_dir.name) / "status.json"
         admin_api.WG_CONFIG_PATH = Path(self.temp_dir.name) / "wg0.conf"
@@ -38,6 +41,9 @@ class AdminApiTests(unittest.TestCase):
         admin_api.ADBLOCK_HOSTS_PATH = Path(self.temp_dir.name) / "ads.hosts"
         admin_api.ADBLOCK_STATE_PATH = Path(self.temp_dir.name) / "adblock.json"
         admin_api.MAINTENANCE_STATE_PATH = Path(self.temp_dir.name) / "maintenance.json"
+        admin_api.DNS_QUERY_LOG_PATH = Path(self.temp_dir.name) / "dns-queries.log"
+        admin_api.DNS_QUERY_LOG_CONFIG_PATH = Path(self.temp_dir.name) / "dns-logging.conf"
+        admin_api.OPENVPN_STATUS_PATH = Path(self.temp_dir.name) / "openvpn-status.log"
         admin_api.ADBLOCK_HOSTS_PATH.write_text("", encoding="utf-8")
         admin_api.WG_CONFIG_PATH.write_text("[Interface]\nAddress = 10.42.0.1/24\n", encoding="utf-8")
         admin_api.STATUS_PATH.write_text('{"protocols":{"services":{}}}', encoding="utf-8")
@@ -62,6 +68,9 @@ class AdminApiTests(unittest.TestCase):
         admin_api.ADBLOCK_HOSTS_PATH = self.original_adblock_hosts_path
         admin_api.ADBLOCK_STATE_PATH = self.original_adblock_state_path
         admin_api.MAINTENANCE_STATE_PATH = self.original_maintenance_state_path
+        admin_api.DNS_QUERY_LOG_PATH = self.original_dns_query_log_path
+        admin_api.DNS_QUERY_LOG_CONFIG_PATH = self.original_dns_query_log_config_path
+        admin_api.OPENVPN_STATUS_PATH = self.original_openvpn_status_path
         self.temp_dir.cleanup()
 
     def request(self, method, path, payload=None, cookie=None, csrf=None, origin=None):
@@ -140,7 +149,10 @@ class AdminApiTests(unittest.TestCase):
                 data["adblock"]["blockedDomains"],
                 ["ads.example.com", "tracking.example.net"],
             )
-            self.assertIn("fakenews-gambling-porn/hosts", data["adblock"]["sourceUrl"])
+            self.assertIn(
+                "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/fakenews-gambling-porn/hosts",
+                data["adblock"]["sourceUrl"],
+            )
             self.assertEqual(
                 json.loads(admin_api.ADBLOCK_STATE_PATH.read_text(encoding="utf-8"))["blocked_domains"],
                 ["ads.example.com", "tracking.example.net"],
@@ -266,6 +278,119 @@ class AdminApiTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "maintenance firewall"):
                 admin_api.set_vpn_forwarding_block(False)
+
+    def test_dns_query_logging_is_opt_in_and_attributes_queries_to_vpn_client(self):
+        now = int(time.time())
+        with admin_api.database() as connection:
+            connection.execute(
+                "INSERT INTO vpn_clients(id, username, public_key, private_key, address, created_at, protocol) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'wireguard')",
+                ("dns-client", "field-laptop", "dns-public", "private", "10.42.0.8/32", now),
+            )
+        admin_api.DNS_QUERY_LOG_PATH.write_text(
+            "Sep 27 16:00:00 dnsmasq[123]: 1234 10.42.0.8/51342 query[A] ads.example.com from 10.42.0.8\n"
+            "Sep 27 16:00:01 dnsmasq[123]: 1235 10.42.0.8/51342 query[AAAA] video.example.net from 10.42.0.8\n",
+            encoding="utf-8",
+        )
+        admin_api.OPENVPN_STATUS_PATH.write_text(
+            "ROUTING_TABLE,10.8.0.4,openvpn-laptop,198.51.100.9:51820,0\n",
+            encoding="utf-8",
+        )
+        with admin_api.DNS_QUERY_LOG_PATH.open("a", encoding="utf-8") as query_log:
+            query_log.write(
+                "Sep 27 16:00:02 dnsmasq[123]: 1236 10.8.0.4/51342 query[A] media.example.org from 10.8.0.4\n"
+            )
+        queries = admin_api.read_dns_queries()
+        self.assertEqual(len(queries), 3)
+        self.assertEqual(queries[0]["client"], "openvpn-laptop")
+        self.assertEqual(queries[0]["clientIp"], "10.8.0.4")
+        self.assertEqual(queries[0]["domain"], "media.example.org")
+        self.assertEqual(queries[1]["client"], "field-laptop")
+        self.assertFalse(admin_api.dns_query_logging_enabled())
+
+        with patch.object(
+            admin_api.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, "", ""),
+        ) as run:
+            self.assertTrue(admin_api.set_dns_query_logging(True))
+            self.assertTrue(admin_api.dns_query_logging_enabled())
+            self.assertIn("log-queries=extra", admin_api.DNS_QUERY_LOG_CONFIG_PATH.read_text(encoding="utf-8"))
+            self.assertFalse(admin_api.set_dns_query_logging(False))
+            self.assertFalse(admin_api.dns_query_logging_enabled())
+            self.assertEqual(run.call_count, 4)
+
+        login, cookie = self.sign_in()
+        _, _, cookie = self.request(
+            "POST",
+            "/api/password",
+            {"oldPassword": "temporary-passphrase", "newPassword": "longer-secure-passphrase-42"},
+            cookie=cookie,
+            csrf=login["csrfToken"],
+        )
+        _, session, _ = self.request("GET", "/api/session", cookie=cookie)
+        status, _, _ = self.request("GET", "/api/telemetry/dns")
+        self.assertEqual(status, 401)
+        status, response, _ = self.request("GET", "/api/telemetry/dns", cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(response["queries"][0]["client"], "openvpn-laptop")
+        status, _, _ = self.request(
+            "POST", "/api/telemetry/dns", {"enabled": True}, cookie=cookie
+        )
+        self.assertEqual(status, 403)
+        with patch.object(
+            admin_api.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, "", ""),
+        ):
+            status, response, _ = self.request(
+                "POST",
+                "/api/telemetry/dns",
+                {"enabled": True},
+                cookie=cookie,
+                csrf=session["csrfToken"],
+            )
+        self.assertEqual(status, 200)
+        self.assertTrue(response["enabled"])
+        status, portal_session, _ = self.request("GET", "/api/portal/session")
+        self.assertEqual(status, 200)
+        self.assertTrue(portal_session["dnsLoggingEnabled"])
+
+    def test_active_connections_separate_public_endpoint_from_assigned_vpn_ip(self):
+        now = int(time.time())
+        with admin_api.database() as connection:
+            connection.execute(
+                "INSERT INTO vpn_clients(id, username, public_key, private_key, address, created_at, protocol) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'wireguard')",
+                ("connection-client", "remote-user", "peer-public", "private", "10.42.0.9/32", now),
+            )
+        admin_api.OPENVPN_STATUS_PATH.write_text(
+            "ROUTING_TABLE,10.8.0.6,openvpn-user,203.0.113.20:53321,0\n",
+            encoding="utf-8",
+        )
+
+        def mock_command(arguments, **kwargs):
+            if arguments == ["wg", "show", "wg0", "dump"]:
+                dump = (
+                    "wg0\tserver-public\t51820\toff\n"
+                    f"peer-public\t(none)\t198.51.100.44:51234\t10.42.0.9/32\t{now}\t100\t200\toff\n"
+                )
+                return subprocess.CompletedProcess(arguments, 0, dump, "")
+            if arguments == ["who"]:
+                return subprocess.CompletedProcess(arguments, 0, "", "")
+            self.fail(f"Unexpected command: {arguments}")
+
+        with patch.object(admin_api.subprocess, "run", side_effect=mock_command):
+            connections = admin_api.read_connections()
+        wireguard = next(item for item in connections if item["proto"] == "wireguard")
+        self.assertEqual(wireguard["user"], "remote-user")
+        self.assertEqual(wireguard["ip"], "198.51.100.44")
+        self.assertEqual(wireguard["tunnelIp"], "10.42.0.9")
+        self.assertEqual(wireguard["remoteEndpoint"], "198.51.100.44:51234")
+        openvpn = next(item for item in connections if item["proto"] == "openvpn")
+        self.assertEqual(openvpn["user"], "openvpn-user")
+        self.assertEqual(openvpn["ip"], "203.0.113.20")
+        self.assertEqual(openvpn["tunnelIp"], "10.8.0.6")
 
     def test_vpn_endpoint_helpers_format_ipv6_authorities(self):
         with patch.dict(os.environ, {"DOMAIN": "2001:db8::10", "WG_PORT": "51820"}):
@@ -755,7 +880,20 @@ class AdminApiTests(unittest.TestCase):
             self.assertTrue(response["adblock"]["enabled"])
             self.assertEqual(
                 admin_api.ADBLOCK_CONFIG_PATH.read_text(encoding="utf-8"),
-                f"addn-hosts={admin_api.ADBLOCK_HOSTS_PATH}\n",
+                "conf-file=/var/lib/vpnfront/adblock-dnsmasq.conf\n",
+            )
+
+            admin_api.ADBLOCK_CONFIG_PATH.write_text(
+                f"addn-hosts={admin_api.ADBLOCK_HOSTS_PATH}\n", encoding="utf-8"
+            )
+            status, response, _ = self.request(
+                "POST", "/api/adblock", {"enabled": True}, cookie=cookie, csrf=csrf
+            )
+            self.assertEqual(status, 200)
+            self.assertTrue(response["adblock"]["enabled"])
+            self.assertEqual(
+                admin_api.ADBLOCK_CONFIG_PATH.read_text(encoding="utf-8"),
+                "conf-file=/var/lib/vpnfront/adblock-dnsmasq.conf\n",
             )
 
             def reject_config(arguments, **kwargs):
