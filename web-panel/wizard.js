@@ -108,9 +108,9 @@
       title: 'Step 2 / 4 — Portal password',
       body: `
         <p class="wiz-lede">Set the password for the client portal, or skip if this account won't log in.</p>
-        <label class="wiz-label">Password <span class="wiz-hint">(min 4 chars, or click Random)</span></label>
+        <label class="wiz-label">Password <span class="wiz-hint">(min 14 characters, or click Random)</span></label>
         <div class="wiz-row">
-          <input id="wizPass" class="wiz-input" type="text" placeholder="Password" value="${esc(state.password)}" autocomplete="off" />
+          <input id="wizPass" class="wiz-input" type="password" minlength="14" maxlength="256" placeholder="Password" value="${esc(state.password)}" autocomplete="new-password" />
           <button type="button" class="wiz-btn wiz-btn-ghost" id="wizRand">Random</button>
         </div>
         <label class="wiz-check">
@@ -122,9 +122,9 @@
       next: () => {
         const skip = document.getElementById('wizSkip').checked;
         const pw = (document.getElementById('wizPass').value || '');
-        if (!skip && pw.length < 4) {
+        if (!skip && (pw.length < 14 || pw.length > 256)) {
           const e = document.getElementById('wizErr');
-          e.textContent = 'Password must be at least 4 characters, or check "Skip".';
+          e.textContent = 'Password must be 14-256 characters, or check "Skip".';
           e.hidden = false;
           return false;
         }
@@ -214,7 +214,7 @@
           const body = {
             username: state.username,
             protocol: state.protocol,
-            durationHours: durationSeconds(),
+            durationSeconds: durationSeconds(),
           };
           if (state.skipPassword) body.skipPassword = true;
           else body.password = state.password;
@@ -240,6 +240,7 @@
             if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
           }
           close();
+          if (typeof window.showCreatedClient === 'function') window.showCreatedClient(j);
           if (window.toast) window.toast('Account ' + state.username + ' created', 'success');
           if (typeof loadVPNClients === 'function') loadVPNClients();
           else if (typeof window.__telemetryTick === 'function') window.__telemetryTick();
@@ -296,6 +297,7 @@
     }
     document.body.style.overflow = '';
     open = false;
+    state.password = '';
   }
 
   // ---------- Trigger ----------

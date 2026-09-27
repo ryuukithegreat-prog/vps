@@ -7,6 +7,8 @@ const state = {
   requestPending: false,
   previousStatus: null,
 };
+const WELCOME_TOUR_KEY = 'vpn-client-welcome-v1:';
+let welcomeTourDismissedThisPage = false;
 
 async function request(path, { method = 'GET', body, csrf = true } = {}) {
   const headers = new Headers();
@@ -86,6 +88,11 @@ function showLogin(message = '') {
   state.csrfToken = '';
   state.mustChangePassword = false;
   state.previousStatus = null;
+  state.username = '';
+  state.account = null;
+  document.getElementById('transportPanel')?.remove();
+  document.getElementById('sharePanel')?.remove();
+  byId('welcomeTour').hidden = true;
   { const __e = byId('portalDashboard'); if (__e) __e.hidden = true; }
   { const __e = byId('portalLogin'); if (__e) __e.hidden = false; }
   { const __e = byId('portalPasswordButton'); if (__e) __e.hidden = true; }
@@ -94,6 +101,13 @@ function showLogin(message = '') {
   { const __e = byId('portalLoginError'); if (__e) __e.hidden = !message; }
   byId('portalPassword').value = '';
   if (byId('portalPasswordDialog').open) byId('portalPasswordDialog').close();
+}
+
+function startAccountRefresh() {
+  if (state.refreshTimer || state.mustChangePassword) return;
+  state.refreshTimer = setInterval(() => {
+    if (!document.hidden) loadAccount();
+  }, 5000);
 }
 
 function openPasswordDialog(forced = false) {
@@ -116,26 +130,33 @@ function showDashboard(username) {
   { const __e = byId('portalPasswordButton'); if (__e) __e.hidden = false; }
   { const __e = byId('portalSignOutButton'); if (__e) __e.hidden = false; }
   { const __e = byId('portalAccountName'); if (__e) __e.textContent = username; }
+  if (!state.mustChangePassword) showWelcomeTour();
   loadAccount();
+  startAccountRefresh();
 }
 
-async function loadAccount() {
+function showWelcomeTour() {
+  if (!state.username || state.mustChangePassword || welcomeTourDismissedThisPage) return;
   try {
-    const data = await request('/api/portal/account', { csrf: false });
-    if (data && data.account) {
-      renderAccount(data.account);
-      if (window.__updateDownloadLabel) window.__updateDownloadLabel(data.account);
-    }
-  } catch (err) {
-    showActivity(err.message || 'Unable to load account.', true);
-  }
+    if (localStorage.getItem(WELCOME_TOUR_KEY + state.username.toLowerCase()) === 'dismissed') return;
+  } catch {}
+  byId('welcomeTour').hidden = false;
+  byId('welcomeDismiss').focus();
 }
 
+function dismissWelcomeTour() {
+  welcomeTourDismissedThisPage = true;
+  byId('welcomeTour').hidden = true;
+  try { localStorage.setItem(WELCOME_TOUR_KEY + state.username.toLowerCase(), 'dismissed'); } catch {}
+}
 
 async function restorePortalSession() {
   { const __e = byId('portalHost'); if (__e) __e.textContent = location.host; }
   try {
     const session = await request('/api/portal/session', { csrf: false });
+    const maintenance = session.maintenance;
+    byId('maintenanceBanner').hidden = maintenance?.enabled !== true;
+    byId('maintenanceBannerMessage').textContent = maintenance?.message || 'Some services may be temporarily unavailable.';
     if (!session.authenticated) {
       showLogin();
       return;
@@ -143,6 +164,7 @@ async function restorePortalSession() {
     state.csrfToken = session.csrfToken;
     state.mustChangePassword = session.mustChangePassword;
     showDashboard(session.username);
+    if (state.mustChangePassword) openPasswordDialog(true);
   } catch (error) {
     showLogin(error.message);
   }
@@ -150,6 +172,8 @@ async function restorePortalSession() {
 
 function renderAccount(account) {
   state.account = account;
+  if (window.__updateDownloadLabel) window.__updateDownloadLabel(account);
+  if (window.__updatePortalTransports) window.__updatePortalTransports(account.protocol);
   try {
     const lbl = document.getElementById('downloadLabel');
     if (lbl) {
@@ -164,13 +188,19 @@ function renderAccount(account) {
 
   const previousStatus = state.previousStatus;
   state.previousStatus = account.status;
+  const isWireGuard = account.protocol === 'wireguard';
   const connected = account.status === 'connected';
-  const statusText = connected ? 'Connected' : account.status === 'expired' ? 'Expired' : 'Idle';
+  const accessActive = account.active !== false && account.status !== 'expired';
+  const statusText = connected ? 'Connected' : account.status === 'expired' ? 'Expired' : account.protocol === 'wireguard' ? 'Idle' : 'Active';
   { const __e = byId('accountStatus'); if (__e) __e.textContent = statusText; }
-  { const __e = byId('accountStatusHint'); if (__e) __e.textContent = connected ? (account.protocol === 'wireguard' ? 'Recent WireGuard handshake' : 'Active') : account.status === 'expired' ? 'Access has ended' : (account.protocol === 'wireguard' ? 'No recent handshake detected' : 'No activity yet'); }
-  byId('portalLiveIndicator').classList.toggle('is-offline', !connected);
-  byId('liveDot').className = `portal-live-dot ${connected ? 'is-online' : 'is-offline'}`;
-  { const __e = byId('liveLabel'); if (__e) __e.textContent = connected ? 'Connected now' : account.status === 'expired' ? 'Access expired' : 'Not connected'; }
+  { const __e = byId('accountStatusHint'); if (__e) __e.textContent = connected ? 'Recent WireGuard handshake' : account.status === 'expired' ? 'Access has ended' : account.protocol === 'wireguard' ? 'No recent handshake detected' : 'Account active; live connection data is unavailable for this protocol'; }
+  { const __e = byId('accountAddressLabel'); if (__e) __e.textContent = isWireGuard ? 'Assigned address' : 'Account name'; }
+  { const __e = byId('portalTelemetryLabel'); if (__e) __e.textContent = isWireGuard ? 'WIREGUARD / LIVE TELEMETRY' : `${(account.protocolLabel || account.protocol).toUpperCase()} / ACCOUNT`; }
+  { const __e = byId('portalRefreshLabel'); if (__e) __e.textContent = isWireGuard ? 'Live updates every 5 seconds' : 'Account refresh every 5 seconds'; }
+  for (const id of ['accountHandshakeRow', 'accountUploadedRow', 'accountDownloadedRow']) byId(id).hidden = !isWireGuard;
+  byId('portalLiveIndicator').classList.toggle('is-offline', !accessActive);
+  byId('liveDot').className = `portal-live-dot ${connected ? 'is-online' : !accessActive ? 'is-offline' : ''}`;
+  { const __e = byId('liveLabel'); if (__e) __e.textContent = connected ? 'Connected now' : account.status === 'expired' ? 'Access expired' : account.protocol === 'wireguard' ? 'Not connected' : 'Access active'; }
   { const __e = byId('lastUpdated'); if (__e) __e.textContent = `Updated ${new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(new Date())}`; }
   { const __e = byId('accountAddress'); if (__e) __e.textContent = account.address; }
   { const __e = byId('accountAge'); if (__e) __e.textContent = formatDuration(account.ageSeconds); }
@@ -180,9 +210,9 @@ function renderAccount(account) {
   { const __e = byId('accountHandshake'); if (__e) __e.textContent = relativeHandshake(account.handshakeAgeSeconds); }
   { const __e = byId('accountUploaded'); if (__e) __e.textContent = formatBytes(account.bytesReceived); }
   { const __e = byId('accountDownloaded'); if (__e) __e.textContent = formatBytes(account.bytesSent); }
-  { const __e = byId('accountTerm'); if (__e) __e.textContent = account.durationDays ? `${account.durationDays} days` : 'No expiry'; }
+  { const __e = byId('accountTerm'); if (__e) __e.textContent = account.expiresAt && account.createdAt ? formatDuration(account.expiresAt - account.createdAt) : 'No expiry'; }
   { const __e = byId('accountCreated'); if (__e) __e.textContent = formatDate(account.createdAt); }
-  document.querySelector('.portal-status-metric').classList.toggle('is-offline', !connected);
+  document.querySelector('.portal-status-metric').classList.toggle('is-offline', !accessActive);
   if (previousStatus && previousStatus !== account.status) {
     showActivity(`VPN status changed: ${previousStatus} → ${account.status}.`, !connected);
   }
@@ -224,6 +254,7 @@ async function signIn(event) {
     state.mustChangePassword = session.mustChangePassword;
     byId('portalPassword').value = '';
     showDashboard(session.username);
+    if (state.mustChangePassword) openPasswordDialog(true);
     showActivity('Signed in to your SAEKA VPN account.');
   } catch (requestError) {
     error.textContent = requestError.message;
@@ -261,6 +292,7 @@ async function changePassword(event) {
     } else {
       loadAccount();
     }
+    showWelcomeTour();
   } catch (requestError) {
     error.textContent = requestError.message;
     error.hidden = false;
@@ -320,6 +352,26 @@ byId('portalLoginForm').addEventListener('submit', signIn);
 byId('portalPasswordButton').addEventListener('click', () => openPasswordDialog(false));
 byId('portalSignOutButton').addEventListener('click', signOut);
 byId('portalPasswordForm').addEventListener('submit', changePassword);
+byId('welcomeDismiss').addEventListener('click', dismissWelcomeTour);
+byId('welcomeSkip').addEventListener('click', dismissWelcomeTour);
+byId('welcomeTour').addEventListener('keydown', (event) => {
+  if (event.key === 'Escape') {
+    dismissWelcomeTour();
+    return;
+  }
+  if (event.key !== 'Tab') return;
+  const controls = [byId('welcomeSkip'), byId('welcomeDismiss')];
+  if (event.shiftKey && document.activeElement === controls[0]) {
+    event.preventDefault();
+    controls[1].focus();
+  } else if (!event.shiftKey && document.activeElement === controls[1]) {
+    event.preventDefault();
+    controls[0].focus();
+  }
+});
+byId('welcomeTour').addEventListener('click', (event) => {
+  if (event.target === byId('welcomeTour')) dismissWelcomeTour();
+});
 byId('portalPasswordDialog').addEventListener('cancel', (event) => { if (state.mustChangePassword) event.preventDefault(); });
 byId('cancelPortalPassword').addEventListener('click', () => byId('portalPasswordDialog').close());
 byId('downloadPortalConfig').addEventListener('click', downloadPortalConfig);
@@ -421,15 +473,23 @@ function downloadConfigRaw(filename, text) {
 
 /* ==== Xray transport chooser ==== */
 (function () {
-  async function showTransports() {
+  let loadedProtocol = '';
+  async function showTransports(protocol) {
+    if (!['xray', 'vless', 'vmess', 'trojan'].includes((protocol || '').toLowerCase())) {
+      document.getElementById('transportPanel')?.remove();
+      loadedProtocol = '';
+      return;
+    }
+    if (loadedProtocol === protocol) return;
     try {
       const r = await fetch('/api/portal/transports', { credentials: 'same-origin', cache: 'no-store' });
-      if (!r.ok) return;
+      if (!r.ok) throw new Error(`Request failed (${r.status}).`);
       const j = await r.json();
-      if (!j.transports || !j.transports.length) return;
+      if (!j.transports || !j.transports.length) throw new Error('No transports are available.');
 
       const host = document.querySelector('.portal-main');
-      if (!host || document.getElementById('transportPanel')) return;
+      if (!host) return;
+      document.getElementById('transportPanel')?.remove();
 
       const wrap = document.createElement('section');
       wrap.id = 'transportPanel';
@@ -451,7 +511,10 @@ function downloadConfigRaw(filename, text) {
           `).join('')}
         </div>
       `;
-      host.appendChild(wrap);
+      const connectionSection = host.querySelector('[aria-labelledby="connectionHeading"]');
+      if (connectionSection) connectionSection.after(wrap);
+      else host.appendChild(wrap);
+      loadedProtocol = protocol;
 
       wrap.addEventListener('click', async (e) => {
         const btn = e.target.closest('[data-share]');
@@ -463,21 +526,18 @@ function downloadConfigRaw(filename, text) {
           setTimeout(() => btn.textContent = 'Copy', 1500);
         } catch (_) { prompt('Copy this URL:', txt); }
       });
-    } catch (e) {}
-  }
-  let shown = false;
-  setInterval(() => {
-    if (document.querySelector('.portal-account') && !shown) {
-      shown = true;
-      showTransports();
+    } catch (error) {
+      showActivity(error.message || 'Xray transports are unavailable.', true);
     }
-  }, 800);
+  }
+  window.__updatePortalTransports = showTransports;
 })();
 
 /* ==== Copy-share panel ==== */
 (function () {
   async function injectSharePanel() {
     if (document.getElementById('sharePanel')) return;
+    if (!['xray', 'vless', 'vmess', 'trojan'].includes((state.account?.protocol || '').toLowerCase())) return;
     const host = document.querySelector('.portal-main');
     if (!host) return;
 
@@ -524,7 +584,7 @@ function downloadConfigRaw(filename, text) {
 
   let tries = 0;
   const iv = setInterval(() => {
-    if (document.querySelector('.portal-account') || document.querySelector('[aria-labelledby="connectionHeading"]')) {
+    if (state.account) {
       injectSharePanel();
       clearInterval(iv);
     }

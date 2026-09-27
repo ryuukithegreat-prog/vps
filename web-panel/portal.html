@@ -6,9 +6,9 @@
     <meta name="theme-color" content="#172923" />
     <meta name="robots" content="noindex, nofollow" />
     <title>SAEKA VPN | Account Access</title>
-    <link rel="stylesheet" href="/portal.css?v=1790398829" />
+    <link rel="stylesheet" href="/portal.css?v=2026092703" />
     <link rel="stylesheet" href="/extras.css?v=1790400669" />
-    <script src="/portal.js?v=1790400669" defer></script>
+    <script src="/portal.js?v=2026092703" defer></script>
   </head>
   <body>
 <div id="toastStack" aria-live="polite"></div>
@@ -21,24 +21,28 @@
 </div>
 
 
-<aside id="welcomeTour" class="welcome-tour" hidden>
+<aside id="welcomeTour" class="welcome-tour" role="dialog" aria-modal="true" aria-labelledby="welcomeTourTitle" hidden>
   <div class="welcome-card">
     <button type="button" class="welcome-skip" id="welcomeSkip" aria-label="Skip tour">Skip</button>
     <p class="welcome-kicker">FIRST TIME HERE</p>
-    <h2>Welcome to your VPN portal</h2>
-    <p class="welcome-lede">Three quick steps and you are set up.</p>
+    <h2 id="welcomeTourTitle">Connect your device</h2>
+    <p class="welcome-lede">Your account is ready. Follow these steps to connect securely.</p>
     <ol class="welcome-steps">
       <li>
         <strong>Change your password</strong>
         <span>Tap <em>Change password</em> at the top right. Pick something only you know.</span>
       </li>
       <li>
-        <strong>Download your config</strong>
-        <span>Hit <em>Download config</em> below. The file contains your key — keep it private.</span>
+        <strong>Download your profile</strong>
+        <span>Use <em>Download config</em> below. Depending on your VPN type, this downloads a profile, link, or credentials.</span>
       </li>
       <li>
-        <strong>Import into your client</strong>
-        <span>Open your VPN app (WireGuard / OpenVPN / v2rayNG / SSH client) and import the file.</span>
+        <strong>Install a compatible VPN app</strong>
+        <span>Use the official WireGuard or OpenVPN app, or the client recommended by your administrator for your account type.</span>
+      </li>
+      <li>
+        <strong>Import and connect</strong>
+        <span>Import the downloaded profile, enable the connection, then return here to check account status. Keep your profile private.</span>
       </li>
     </ol>
     <button type="button" class="welcome-go" id="welcomeDismiss">Got it</button>
@@ -58,6 +62,8 @@
           <a class="portal-admin-link" href="/admin/">Admin</a>
         </div>
       </header>
+
+      <aside class="maintenance-banner" id="maintenanceBanner" role="status" hidden><strong>Maintenance notice</strong><span id="maintenanceBannerMessage"></span></aside>
 
       <main class="portal-main">
         <section class="portal-login" id="portalLogin" aria-labelledby="loginHeading">
@@ -90,18 +96,18 @@
           <div class="portal-notice" id="portalError" role="alert" hidden></div>
           <div class="portal-metrics" aria-live="polite">
             <article class="portal-metric portal-status-metric"><p>VPN status</p><strong id="accountStatus">—</strong><small id="accountStatusHint">Checking current handshake</small></article>
-            <article class="portal-metric"><p>Assigned address</p><strong class="metric-mono" id="accountAddress">—</strong><small id="accountAddressHint">VPN address</small></article>
+            <article class="portal-metric"><p id="accountAddressLabel">Assigned address</p><strong class="metric-mono" id="accountAddress">—</strong><small id="accountAddressHint">VPN address</small></article>
             <article class="portal-metric"><p>Account runtime</p><strong id="accountAge">—</strong><small>Since account creation</small></article>
             <article class="portal-metric"><p>Access remaining</p><strong id="accountRemaining">—</strong><small id="accountExpiry">No expiry</small></article>
           </div>
 
           <section class="portal-detail-section" aria-labelledby="connectionHeading">
-            <div class="portal-section-heading"><div><p class="portal-kicker">WIREGUARD / LIVE TELEMETRY</p><h2 id="connectionHeading">Connection details</h2></div><span class="portal-refresh-label">Updates every 5 seconds</span></div>
+            <div class="portal-section-heading"><div><p class="portal-kicker" id="portalTelemetryLabel">WIREGUARD / LIVE TELEMETRY</p><h2 id="connectionHeading">Connection details</h2></div><span class="portal-refresh-label" id="portalRefreshLabel">Live updates every 5 seconds</span></div>
             <dl class="portal-detail-grid">
               <div><dt>Server endpoint</dt><dd id="accountEndpoint">No active endpoint</dd></div>
-              <div><dt>Last handshake</dt><dd id="accountHandshake">No handshake yet</dd></div>
-              <div><dt>Data uploaded</dt><dd id="accountUploaded">—</dd></div>
-              <div><dt>Data downloaded</dt><dd id="accountDownloaded">—</dd></div>
+              <div id="accountHandshakeRow"><dt>Last handshake</dt><dd id="accountHandshake">No handshake yet</dd></div>
+              <div id="accountUploadedRow"><dt>Data uploaded</dt><dd id="accountUploaded">—</dd></div>
+              <div id="accountDownloadedRow"><dt>Data downloaded</dt><dd id="accountDownloaded">—</dd></div>
               <div><dt>Access term</dt><dd id="accountTerm">—</dd></div>
               <div><dt>Created</dt><dd id="accountCreated">—</dd></div>
             </dl>

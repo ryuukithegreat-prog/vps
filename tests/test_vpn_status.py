@@ -11,6 +11,12 @@ SPEC.loader.exec_module(vpn_status)
 
 
 class StatusParserTests(unittest.TestCase):
+    def test_ssh_counts_logged_in_sessions(self):
+        output = """alice pts/0 2026-09-27 08:00 (198.51.100.1)
+bob pts/1 2026-09-27 08:10 (198.51.100.2)
+reboot system boot 2026-09-27 07:00"""
+        self.assertEqual(vpn_status.parse_ssh_sessions(output), 2)
+
     def test_wireguard_counts_recent_handshakes_only(self):
         output = """wg0 private public 51820 off
 wg0 active-key (none) 198.51.100.4:50000 10.42.0.2/32 999 1024 2048 25

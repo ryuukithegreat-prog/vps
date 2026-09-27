@@ -39,12 +39,33 @@ WG_CONFIG_PATH = Path(os.environ.get("WG_CONFIG_PATH", "/etc/wireguard/wg0.conf"
 ADBLOCK_CONFIG_PATH = Path(os.environ.get("ADBLOCK_CONFIG_PATH", "/etc/dnsmasq.d/vpnfront-adblock.conf"))
 ADBLOCK_HOSTS_PATH = Path(os.environ.get("ADBLOCK_HOSTS_PATH", "/var/lib/vpnfront/ads.hosts"))
 ADBLOCK_STATE_PATH = Path(os.environ.get("ADBLOCK_STATE_PATH", "/var/lib/vpnfront/adblock.json"))
+MAINTENANCE_STATE_PATH = Path(os.environ.get("MAINTENANCE_STATE_PATH", "/var/lib/vpnfront/maintenance.json"))
 ADBLOCK_SOURCE_URL = "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
+ADBLOCK_LEVELS = {
+    "light": {
+        "label": "Light",
+        "url": ADBLOCK_SOURCE_URL,
+    },
+    "balanced": {
+        "label": "Balanced",
+        "url": "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/fakenews-gambling/hosts",
+    },
+    "strict": {
+        "label": "Strict",
+        "url": "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/fakenews-gambling-porn/hosts",
+    },
+}
+BLOCKED_DOMAIN_PATTERN = re.compile(
+    r"(?=.{1,253}\Z)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z"
+)
+MAX_BLOCKED_DOMAINS = 500
 WG_CLIENT_NETWORK = ipaddress.ip_network("10.42.0.0/24")
 WG_GATEWAY_ADDRESS = ipaddress.ip_address("10.42.0.1")
 WG_DEFAULT_PORT = 51820
 WG_HANDSHAKE_ACTIVE_SECONDS = 180
 CLIENT_DURATION_OPTIONS = {0, 1, 7, 30, 90}
+MAX_CLIENT_DURATION_SECONDS = 365 * 24 * 60 * 60
 client_operations_lock = threading.RLock()
 SERVICE_UNITS = {
     "nginx": ("nginx.service",),
@@ -296,6 +317,27 @@ def validate_client_name(username):
     return username
 
 
+def parse_client_duration(payload):
+    duration_seconds = payload.get("durationSeconds", payload.get("durationHours"))
+    legacy_days = payload.get("durationDays")
+    if duration_seconds is None and legacy_days is None:
+        return 30 * 24 * 60 * 60
+
+    value = legacy_days if duration_seconds is None else duration_seconds
+    if isinstance(value, bool) or not (
+        isinstance(value, int)
+        or isinstance(value, str) and re.fullmatch(r"\d+", value.strip())
+    ):
+        raise ValueError("Duration must be a non-negative whole number.")
+    value = int(value)
+    seconds = value * 86400 if duration_seconds is None else value
+    if seconds < 0:
+        raise ValueError("Duration must be a non-negative whole number.")
+    if seconds > MAX_CLIENT_DURATION_SECONDS:
+        raise ValueError("Duration cannot exceed 365 days.")
+    return seconds
+
+
 def wireguard_command(arguments, input_text=None):
     try:
         result = subprocess.run(
@@ -403,14 +445,65 @@ def read_adblock_state():
         state = {}
     if not isinstance(state, dict):
         state = {}
+    level = state.get("level", "balanced")
+    if level not in ADBLOCK_LEVELS:
+        level = "balanced"
+    blocked_domains = state.get("blocked_domains", [])
+    if not isinstance(blocked_domains, list):
+        blocked_domains = []
+    blocked_domains = [
+        domain.lower()
+        for domain in blocked_domains
+        if isinstance(domain, str) and BLOCKED_DOMAIN_PATTERN.fullmatch(domain)
+    ][:MAX_BLOCKED_DOMAINS]
     return {
         "enabled": state.get("enabled") is True,
         "hostCount": max(0, int(state.get("host_count", 0) or 0)),
         "updatedAt": state.get("updated_at"),
         "lastError": state.get("last_error"),
-        "source": "StevenBlack hosts",
-        "sourceUrl": ADBLOCK_SOURCE_URL,
+        "level": level,
+        "blockedDomains": blocked_domains,
+        "source": f"StevenBlack {ADBLOCK_LEVELS[level]['label']} hosts",
+        "sourceUrl": ADBLOCK_LEVELS[level]["url"],
     }
+
+
+def validate_blocked_domains(domains):
+    if not isinstance(domains, list) or len(domains) > MAX_BLOCKED_DOMAINS:
+        raise ValueError(f"Provide up to {MAX_BLOCKED_DOMAINS} blocked domains.")
+    normalized = []
+    for domain in domains:
+        if not isinstance(domain, str):
+            raise ValueError("Each blocked website must be a domain name.")
+        domain = domain.strip().lower()
+        if not BLOCKED_DOMAIN_PATTERN.fullmatch(domain):
+            raise ValueError(f"Invalid blocked domain: {domain or '(empty)'}")
+        if domain not in normalized:
+            normalized.append(domain)
+    return normalized
+
+
+def read_maintenance_state():
+    try:
+        state = json.loads(MAINTENANCE_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        state = {}
+    if not isinstance(state, dict):
+        state = {}
+    message = state.get("message", "")
+    if not isinstance(message, str):
+        message = ""
+    return {"enabled": state.get("enabled") is True, "message": message[:500]}
+
+
+def set_maintenance_state(enabled, message):
+    if not isinstance(enabled, bool):
+        raise ValueError("Maintenance notice must be enabled or disabled.")
+    if not isinstance(message, str) or len(message) > 500:
+        raise ValueError("Maintenance notice must be 500 characters or fewer.")
+    state = {"enabled": enabled, "message": message.strip()}
+    _atomic_private_write(MAINTENANCE_STATE_PATH, json.dumps(state, separators=(",", ":")) + "\n")
+    return state
 
 
 def _atomic_private_write(path, content):
@@ -429,24 +522,38 @@ def _atomic_private_write(path, content):
             os.unlink(temporary_path)
 
 
-def _write_adblock_state(enabled, host_count=0, updated_at=None, last_error=None):
+def _write_adblock_state(
+    enabled, host_count=0, updated_at=None, last_error=None, level="balanced", blocked_domains=()
+):
     state = {
         "enabled": bool(enabled),
         "host_count": max(0, int(host_count)),
         "updated_at": updated_at,
         "last_error": last_error,
+        "level": level,
+        "blocked_domains": list(blocked_domains),
     }
     _atomic_private_write(ADBLOCK_STATE_PATH, json.dumps(state, separators=(",", ":")) + "\n")
     return read_adblock_state()
 
 
-def set_adblock_enabled(enabled):
+def set_adblock_enabled(enabled, level=None, blocked_domains=None):
     if not isinstance(enabled, bool):
         raise ValueError("Ad blocking must be enabled or disabled.")
+    current_state = read_adblock_state()
+    level = current_state["level"] if level is None else level
+    if not isinstance(level, str) or level not in ADBLOCK_LEVELS:
+        raise ValueError("Choose a valid ad-blocking level.")
+    if blocked_domains is None:
+        blocked_domains = current_state["blockedDomains"]
+    blocked_domains = validate_blocked_domains(blocked_domains)
     previous_config = ADBLOCK_CONFIG_PATH.read_bytes() if ADBLOCK_CONFIG_PATH.exists() else None
     previous_state = ADBLOCK_STATE_PATH.read_bytes() if ADBLOCK_STATE_PATH.exists() else None
-    current_state = read_adblock_state()
-    if current_state["enabled"] == enabled:
+    if (
+        current_state["enabled"] == enabled
+        and current_state["level"] == level
+        and current_state["blockedDomains"] == blocked_domains
+    ):
         return current_state
     try:
         if enabled:
@@ -458,6 +565,8 @@ def set_adblock_enabled(enabled):
             host_count=current_state["hostCount"],
             updated_at=current_state["updatedAt"],
             last_error=None,
+            level=level,
+            blocked_domains=blocked_domains,
         )
         validation = subprocess.run(
             ["dnsmasq", "--test"], capture_output=True, text=True, timeout=10, check=False
@@ -497,7 +606,7 @@ def set_adblock_enabled(enabled):
 
 
 def create_wireguard_client(username, duration_days):
-    validate_client_name(username)
+    username = validate_client_name(username)
     if duration_days is not None and (isinstance(duration_days, bool) or not isinstance(duration_days, int) or duration_days < 0):
         raise ValueError("Invalid duration.")
 
@@ -547,7 +656,7 @@ def create_wireguard_client(username, duration_days):
             "AllowedIPs = 0.0.0.0/0\n"
             "PersistentKeepalive = 25\n"
         )
-    return {"id": client_id, "username": username, "address": str(address), "createdAt": now, "expiresAt": expires_at, "temporaryPassword": temporary_password}, client_config
+    return {"id": client_id, "username": username, "protocol": "wireguard", "address": str(address), "createdAt": now, "expiresAt": expires_at, "temporaryPassword": temporary_password}, client_config
 
 
 
@@ -555,7 +664,7 @@ XRAY_CONFIG_PATH = Path("/usr/local/etc/xray/config.json")
 XRAY_XHTTP_PATH = "/saeka-vless-xh"
 
 def create_xray_client(username, duration_days):
-    validate_client_name(username)
+    username = validate_client_name(username)
     if duration_days is not None and (isinstance(duration_days, bool) or not isinstance(duration_days, int) or duration_days < 0):
         raise ValueError("Invalid duration.")
     with client_operations_lock, database() as connection:
@@ -596,13 +705,13 @@ def create_xray_client(username, duration_days):
         subprocess.run(["systemctl", "reload", "xray"], capture_output=True, text=True, timeout=15, check=False)
     except (OSError, subprocess.TimeoutExpired):
         pass
-    host = _wireguard_endpoint().split(":")[0]
-    share = f"vless://{client_uuid}@{host}:443?encryption=none&security=tls&sni={host}&type=splithttp&host={host}&path=%2F{XRAY_XHTTP_PATH.lstrip('/')}&mode=auto#{username}"
+    host = _vpn_host()
+    share = f"vless://{client_uuid}@{_host_port(host, 443)}?encryption=none&security=tls&sni={host}&type=splithttp&host={host}&path=%2F{XRAY_XHTTP_PATH.lstrip('/')}&mode=auto#{username}"
     return {"id": client_id, "username": username, "protocol": "xray", "createdAt": now, "expiresAt": expires_at, "temporaryPassword": temp_password}, share
 
 
 def create_ssh_client(username, duration_days):
-    validate_client_name(username)
+    username = validate_client_name(username)
     if duration_days is not None and (isinstance(duration_days, bool) or not isinstance(duration_days, int) or duration_days < 0):
         raise ValueError("Invalid duration.")
     if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_-]{0,31}", username):
@@ -613,9 +722,6 @@ def create_ssh_client(username, duration_days):
             raise ValueError("That VPN account name already exists.")
         temp_password = secrets.token_urlsafe(18)
         cmd = ["useradd", "-M", "-s", "/usr/sbin/nologin"]
-        if duration_days:
-            import datetime as _dt
-            cmd += ["-e", (_dt.date.today() + _dt.timedelta(days=duration_days)).isoformat()]
         cmd.append(username)
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=False)
         if r.returncode != 0:
@@ -635,7 +741,7 @@ def create_ssh_client(username, duration_days):
             "INSERT INTO vpn_clients(id, username, public_key, private_key, address, created_at, expires_at, password_salt, password_hash, must_change_password, protocol, metadata) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'ssh', ?)",
             (client_id, username, "ssh:" + client_id, "ssh:" + client_id, "ssh:" + client_id, now, expires_at, salt, pwh, metadata),
         )
-    host = _wireguard_endpoint().split(":")[0]
+    host = _vpn_host()
     info = "SSH Tunnel\n==========\nHost: " + host + "\nPort: 22\nUser: " + username + "\nPassword: " + temp_password + "\n\nssh " + username + "@" + host
     return {"id": client_id, "username": username, "protocol": "ssh", "createdAt": now, "expiresAt": expires_at, "temporaryPassword": temp_password}, info
 
@@ -656,8 +762,8 @@ def get_xray_client_share(client_id):
     except json.JSONDecodeError:
         meta = {}
     client_uuid = meta.get("uuid", "")
-    host = _wireguard_endpoint().split(":")[0]
-    share = f"vless://{client_uuid}@{host}:443?encryption=none&security=tls&sni={host}&type=xhttp&host={host}&path=%2F{XRAY_XHTTP_PATH.lstrip('/')}&mode=auto#{row['username']}"
+    host = _vpn_host()
+    share = f"vless://{client_uuid}@{_host_port(host, 443)}?encryption=none&security=tls&sni={host}&type=xhttp&host={host}&path=%2F{XRAY_XHTTP_PATH.lstrip('/')}&mode=auto#{row['username']}"
     return row["username"], share
 
 
@@ -666,7 +772,7 @@ def get_ssh_client_info(client_id):
         row = connection.execute("SELECT username FROM vpn_clients WHERE id = ? AND protocol = 'ssh'", (client_id,)).fetchone()
     if row is None:
         raise ValueError("SSH account not found.")
-    host = _wireguard_endpoint().split(":")[0]
+    host = _vpn_host()
     info = "SSH Tunnel\n==========\nHost: " + host + "\nPort: 22\nUser: " + row["username"] + "\n\nssh " + row["username"] + "@" + host
     return row["username"], info
 
@@ -686,9 +792,13 @@ def revoke_xray_client(client_id):
         except (OSError, json.JSONDecodeError) as exc:
             raise RuntimeError("Xray configuration is unavailable.") from exc
         for ib in cfg.get("inbounds", []):
-            if ib.get("protocol") == "vless":
+            protocol = ib.get("protocol")
+            key = "password" if protocol == "trojan" else "id"
+            if protocol in {"vless", "vmess", "trojan"}:
                 clients = ib.get("settings", {}).get("clients", [])
-                ib["settings"]["clients"] = [c for c in clients if c.get("id") != client_uuid]
+                ib["settings"]["clients"] = [
+                    client for client in clients if client.get(key) != client_uuid
+                ]
         tmp = XRAY_CONFIG_PATH.with_suffix(".tmp")
         tmp.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
         os.replace(tmp, XRAY_CONFIG_PATH)
@@ -712,15 +822,34 @@ def revoke_ssh_client(client_id):
 
 
 EASYRSA_DIR = Path("/etc/openvpn/easy-rsa")
+OPENVPN_CRL_PATH = Path("/etc/openvpn/server/crl.pem")
 IPSEC_SECRETS = Path("/etc/ipsec.secrets")
 
 
 def _vpn_host():
-    return _wireguard_endpoint().split(":")[0]
+    try:
+        host = urlsplit(f"//{_wireguard_endpoint()}").hostname
+    except ValueError as exc:
+        raise RuntimeError("The configured VPN endpoint is invalid.") from exc
+    if not host:
+        raise RuntimeError("The configured VPN endpoint is invalid.")
+    return host
+
+
+def _host_authority(host):
+    try:
+        address = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return host
+    return f"[{address.compressed}]" if address.version == 6 else str(address)
+
+
+def _host_port(host, port):
+    return f"{_host_authority(host)}:{port}"
 
 
 def create_openvpn_client(username, duration_days):
-    validate_client_name(username)
+    username = validate_client_name(username)
     if duration_days is not None and (isinstance(duration_days, bool) or not isinstance(duration_days, int) or duration_days < 0):
         raise ValueError("Invalid duration.")
     if not re.fullmatch(r"[a-zA-Z0-9_-]{1,32}", username):
@@ -729,8 +858,11 @@ def create_openvpn_client(username, duration_days):
         connection.execute("BEGIN IMMEDIATE")
         if connection.execute("SELECT 1 FROM vpn_clients WHERE username = ?", (username,)).fetchone():
             raise ValueError("That VPN account name already exists.")
-        r = subprocess.run(["./easyrsa", "--batch", "build-client-full", username, "nopass"],
-                           cwd=str(EASYRSA_DIR), capture_output=True, text=True, timeout=120, check=False)
+        try:
+            r = subprocess.run(["./easyrsa", "--batch", "build-client-full", username, "nopass"],
+                               cwd=str(EASYRSA_DIR), capture_output=True, text=True, timeout=120, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError("OpenVPN client certificate generation failed.") from exc
         if r.returncode != 0:
             raise RuntimeError("easy-rsa failed: " + (r.stderr.strip() or r.stdout.strip()))
         cert_path = EASYRSA_DIR / "pki" / "issued" / (username + ".crt")
@@ -765,8 +897,26 @@ def revoke_openvpn_client(client_id):
         if row is None:
             raise ValueError("OpenVPN account not found.")
         username = row["username"]
-        subprocess.run(["./easyrsa", "--batch", "revoke", username], cwd=str(EASYRSA_DIR), capture_output=True, timeout=30, check=False)
-        subprocess.run(["./easyrsa", "--batch", "gen-crl"], cwd=str(EASYRSA_DIR), capture_output=True, timeout=30, check=False)
+        try:
+            revoke_result = subprocess.run(
+                ["./easyrsa", "--batch", "revoke", username],
+                cwd=str(EASYRSA_DIR), capture_output=True, text=True, timeout=30, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError("OpenVPN certificate revocation failed.") from exc
+        if revoke_result.returncode != 0:
+            raise RuntimeError("OpenVPN certificate revocation failed.")
+        try:
+            crl_result = subprocess.run(
+                ["./easyrsa", "--batch", "gen-crl"],
+                cwd=str(EASYRSA_DIR), capture_output=True, text=True, timeout=30, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError("OpenVPN certificate revocation list could not be generated.") from exc
+        crl_source = EASYRSA_DIR / "pki" / "crl.pem"
+        if crl_result.returncode != 0 or not crl_source.exists():
+            raise RuntimeError("OpenVPN certificate revocation list could not be generated.")
+        _atomic_private_write(OPENVPN_CRL_PATH, crl_source.read_text(encoding="utf-8"))
         for d in ("issued", "private"):
             for suffix in ("crt", "key"):
                 f = EASYRSA_DIR / "pki" / d / (username + "." + suffix)
@@ -776,7 +926,7 @@ def revoke_openvpn_client(client_id):
 
 
 def create_ipsec_client(username, duration_days):
-    validate_client_name(username)
+    username = validate_client_name(username)
     if duration_days is not None and (isinstance(duration_days, bool) or not isinstance(duration_days, int) or duration_days < 0):
         raise ValueError("Invalid duration.")
     if not re.fullmatch(r"[a-zA-Z0-9_.-]{1,32}", username):
@@ -854,7 +1004,26 @@ def get_ipsec_client_info(client_id):
         row = connection.execute("SELECT username FROM vpn_clients WHERE id = ? AND protocol = 'ipsec'", (client_id,)).fetchone()
     if row is None:
         raise ValueError("IPsec account not found.")
-    return row["username"], "IKEv2 profile for " + row["username"]
+    username = row["username"]
+    secret_pattern = re.compile(rf"^{re.escape(username)}\s*:\s*EAP\s+\"([^\"]+)\"\s*$")
+    try:
+        secrets_text = IPSEC_SECRETS.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError("IPsec credentials are unavailable.") from exc
+    password = next(
+        (match.group(1) for line in secrets_text.splitlines() if (match := secret_pattern.fullmatch(line))),
+        None,
+    )
+    if password is None:
+        raise RuntimeError("IPsec credentials are unavailable.")
+    host = _vpn_host()
+    info = (
+        "IKEv2 / IPsec profile\n=====================\n"
+        f"Server:   {host}\nUsername: {username}\nPassword: {password}\nRemote ID: {host}\n\n"
+        "iOS: Settings > General > VPN > Add IKEv2\n"
+        "Android: StrongSwan app\n"
+    )
+    return username, info
 
 
 def toggle_firewall(enabled):
@@ -868,9 +1037,9 @@ def toggle_firewall(enabled):
 
 
 def check_tls_certificate():
-    host = _wireguard_endpoint().split(":")[0]
+    host = _vpn_host()
     try:
-        r = subprocess.run(["openssl", "s_client", "-connect", host + ":443", "-servername", host, "-brief"],
+        r = subprocess.run(["openssl", "s_client", "-connect", _host_port(host, 443), "-servername", host, "-brief"],
                            input="", capture_output=True, text=True, timeout=10, check=False)
         out = (r.stdout or "") + (r.stderr or "")
         if "Verification: OK" in out or "Verify return code: 0" in out:
@@ -1281,7 +1450,7 @@ def _remove_peer_block(config_text, public_key):
 
 
 def _client_endpoint(protocol):
-    host = _wireguard_endpoint().split(":")[0]
+    host = _vpn_host()
     ports = {
         "wireguard": 51820,
         "xray": 443, "vless": 443, "vmess": 443, "trojan": 443,
@@ -1290,18 +1459,19 @@ def _client_endpoint(protocol):
         "ipsec": None, "ikev2": None,
     }
     port = ports.get((protocol or "wireguard").lower())
-    return f"{host}:{port}" if port else host
+    return _host_port(host, port) if port else host
 
 
 def list_all_clients():
     """Return every VPN client regardless of protocol."""
+    expire_non_wireguard_clients()
     wireguard_clients = {
         client["id"]: client for client in list_wireguard_clients()
     }
     clients = []
     with database() as connection:
         rows = connection.execute(
-            "SELECT id, username, protocol, address, created_at, expires_at "
+            "SELECT id, username, protocol, address, created_at, expires_at, password_hash "
             "FROM vpn_clients ORDER BY created_at DESC"
         ).fetchall()
     now = int(time.time())
@@ -1318,7 +1488,11 @@ def list_all_clients():
             "endpoint": _client_endpoint(proto),
             "createdAt": row.get("created_at"),
             "expiresAt": expires,
+            "ageSeconds": max(0, now - (row.get("created_at") or now)),
+            "remainingSeconds": max(0, expires - now) if expires is not None else None,
             "active": active,
+            "status": "active" if active else "expired",
+            "portalReady": row.get("password_hash") is not None,
         }
         if proto == "wireguard":
             client.update(wireguard_clients.get(row["id"], {}))
@@ -1359,6 +1533,31 @@ def expire_wireguard_clients(now=None):
         try:
             revoke_wireguard_client(row["id"])
         except (RuntimeError, ValueError) as exc:
+            logger.warning("action=expire_vpn_client result=failed error=%s", type(exc).__name__)
+
+
+def expire_non_wireguard_clients(now=None):
+    current_time = int(time.time()) if now is None else int(now)
+    revokers = {
+        "xray": revoke_xray_client,
+        "ssh": revoke_ssh_client,
+        "openvpn": revoke_openvpn_client,
+        "ipsec": revoke_ipsec_client,
+    }
+    with database() as connection:
+        expired = connection.execute(
+            "SELECT id, protocol FROM vpn_clients "
+            "WHERE COALESCE(protocol, 'wireguard') != 'wireguard' "
+            "AND expires_at IS NOT NULL AND expires_at <= ?",
+            (current_time,),
+        ).fetchall()
+    for row in expired:
+        revoke = revokers.get(row["protocol"])
+        if revoke is None:
+            continue
+        try:
+            revoke(row["id"])
+        except Exception as exc:
             logger.warning("action=expire_vpn_client result=failed error=%s", type(exc).__name__)
 
 
@@ -1450,6 +1649,7 @@ def build_share_uri(protocol, username, password, host):
     import urllib.parse as _url
     proto = (protocol or "wireguard").lower()
     pw = password or ""
+    host = _host_authority(host)
 
     if proto == "ssh":
         # ssh://user:pass@host:22
@@ -1536,9 +1736,9 @@ def get_client_account(client_id):
         get_wireguard_client_account(row["id"], now)
         if proto == "wireguard" else {}
     )
-    host = _wireguard_endpoint().split(":")[0]
+    host = _vpn_host()
     port = PORTAL_PORTS.get(proto)
-    endpoint = f"{host}:{port}" if port else host
+    endpoint = _host_port(host, port) if port else host
     # Protocol-specific display value for the "address" field
     address = (row["address"] or "")
     # For SSH/Xray/OpenVPN/IPsec we stored "ssh:xxx" style placeholder — clean it
@@ -1587,6 +1787,7 @@ XRAY_TRANSPORTS = [
 
 
 def _share_link(t, uuid, host):
+    authority = _host_authority(host)
     if t.get("protocol") == "vmess":
         import base64 as _b64
         payload = {
@@ -1597,28 +1798,44 @@ def _share_link(t, uuid, host):
         }
         return "vmess://" + _b64.b64encode(json.dumps(payload).encode()).decode()
     if t.get("protocol") == "trojan":
-        return f"trojan://{uuid}@{host}:443?security=tls&sni={host}&type=ws&path={t['path']}&host={host}#Saeka-{t['label']}"
+        return f"trojan://{uuid}@{authority}:443?security=tls&sni={host}&type=ws&path={t['path']}&host={host}#Saeka-{t['label']}"
     # vless
     if t["kind"] == "path":
         if t["id"] == "vless-grpc":
-            return f"vless://{uuid}@{host}:443?encryption=none&security=tls&sni={host}&type=grpc&serviceName={t['service']}#Saeka-{t['label']}"
+            return f"vless://{uuid}@{authority}:443?encryption=none&security=tls&sni={host}&type=grpc&serviceName={t['service']}#Saeka-{t['label']}"
         if t["id"] == "vless-h2":
-            return f"vless://{uuid}@{host}:443?encryption=none&security=tls&sni={host}&type=http&path=%2F{t['path'].lstrip('/')}&host={host}#Saeka-{t['label']}"
+            return f"vless://{uuid}@{authority}:443?encryption=none&security=tls&sni={host}&type=http&path=%2F{t['path'].lstrip('/')}&host={host}#Saeka-{t['label']}"
         net = "splithttp" if "xhttp" in t["id"] else "ws"
-        return f"vless://{uuid}@{host}:443?encryption=none&security=tls&sni={host}&type={net}&path=%2F{t['path'].lstrip('/')}&host={host}#Saeka-{t['label']}"
+        return f"vless://{uuid}@{authority}:443?encryption=none&security=tls&sni={host}&type={net}&path=%2F{t['path'].lstrip('/')}&host={host}#Saeka-{t['label']}"
     # direct TCP/KCP/QUIC
     net = "tcp" if t["id"] == "vless-tcp" else ("kcp" if t["id"] == "vless-kcp" else "quic")
-    return f"vless://{uuid}@{host}:{t['port']}?encryption=none&security=none&type={net}#Saeka-{t['label']}"
+    return f"vless://{uuid}@{_host_port(host, t['port'])}?encryption=none&security=none&type={net}#Saeka-{t['label']}"
 
 
 def xray_transports(uuid):
-    host = _wireguard_endpoint().split(":")[0]
+    host = _vpn_host()
     out = []
     for t in XRAY_TRANSPORTS:
         item = dict(t)
         item["share"] = _share_link(t, uuid, host)
         out.append(item)
     return out
+
+
+def get_xray_client_transports(client_id):
+    with database() as connection:
+        row = connection.execute(
+            "SELECT protocol, metadata FROM vpn_clients WHERE id = ?",
+            (client_id,),
+        ).fetchone()
+    if row is None or row["protocol"] not in {"xray", "vless", "vmess", "trojan"}:
+        raise ValueError("Xray account not found.")
+    try:
+        metadata = json.loads(row["metadata"] or "{}")
+        client_uuid = str(uuid.UUID(metadata["uuid"]))
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("Xray account credentials are invalid.") from exc
+    return xray_transports(client_uuid)
 
 
 
@@ -1658,8 +1875,8 @@ CONFIG_META = {
     "vmess":     ("txt",  "text/plain; charset=utf-8"),
     "trojan":    ("txt",  "text/plain; charset=utf-8"),
     "ssh":       ("txt",  "text/plain; charset=utf-8"),
-    "ipsec":     ("mobileconfig", "application/x-apple-aspen-config"),
-    "ikev2":     ("mobileconfig", "application/x-apple-aspen-config"),
+    "ipsec":     ("txt", "text/plain; charset=utf-8"),
+    "ikev2":     ("txt", "text/plain; charset=utf-8"),
 }
 
 
@@ -1925,7 +2142,7 @@ class AdminHandler(BaseHTTPRequestHandler):
             expire_wireguard_clients()
             session = self.get_client_session()
             if session is None:
-                self.send_json(200, {"authenticated": False})
+                self.send_json(200, {"authenticated": False, "maintenance": read_maintenance_state()})
             else:
                 client_ip = self.headers.get("X-Real-IP") or self.client_address[0]
                 self.send_json(200, {
@@ -1934,6 +2151,7 @@ class AdminHandler(BaseHTTPRequestHandler):
                     "csrfToken": session["csrf_token"],
                     "mustChangePassword": session["must_change_password"],
                     "clientIp": client_ip,
+                    "maintenance": read_maintenance_state(),
                 })
             return
 
@@ -1950,7 +2168,7 @@ class AdminHandler(BaseHTTPRequestHandler):
                 if not row:
                     self.send_json(404, {"error": "Account not found."})
                     return
-                host = _wireguard_endpoint().split(":")[0]
+                host = _vpn_host()
                 # We do NOT store the plaintext password. Show placeholder.
                 uri = build_share_uri(row["protocol"], row["username"], "", host)
                 self.send_json(200, {"uri": uri, "username": row["username"], "protocol": row["protocol"]})
@@ -1962,19 +2180,10 @@ class AdminHandler(BaseHTTPRequestHandler):
             if session is None:
                 return
             try:
-                with database() as _c:
-                    _row = _c.execute(
-                        "SELECT public_key, protocol FROM vpn_clients WHERE id = ?",
-                        (session["client_id"],),
-                    ).fetchone()
-                if not _row:
-                    self.send_json(404, {"error": "Account not found."})
-                    return
-                uuid = _row["public_key"] or ""
-                if ":" in uuid:
-                    uuid = uuid.split(":", 1)[-1]
-                self.send_json(200, {"transports": xray_transports(uuid)})
-            except Exception as exc:
+                self.send_json(200, {"transports": get_xray_client_transports(session["client_id"])})
+            except ValueError as exc:
+                self.send_json(404, {"error": str(exc)})
+            except (OSError, RuntimeError, sqlite3.Error):
                 self.send_json(503, {"error": "transports unavailable"})
             return
         if path == "/api/portal/account":
@@ -2078,6 +2287,11 @@ class AdminHandler(BaseHTTPRequestHandler):
             if self.require_session() is None:
                 return
             self.send_json(200, {"adblock": read_adblock_state()})
+            return
+        if path == "/api/maintenance":
+            if self.require_session() is None:
+                return
+            self.send_json(200, {"maintenance": read_maintenance_state()})
             return
 
         if path == "/api/users":
@@ -2233,7 +2447,11 @@ class AdminHandler(BaseHTTPRequestHandler):
         if path == "/api/adblock":
             enabled = payload.get("enabled")
             try:
-                state = set_adblock_enabled(enabled)
+                state = set_adblock_enabled(
+                    enabled,
+                    level=payload.get("level"),
+                    blocked_domains=payload.get("blockedDomains"),
+                )
             except ValueError as exc:
                 self.send_json(400, {"error": str(exc)})
                 return
@@ -2243,6 +2461,15 @@ class AdminHandler(BaseHTTPRequestHandler):
                 return
             logger.info("admin=%s action=adblock_toggle enabled=%s", session["username"], enabled)
             self.send_json(200, {"adblock": state})
+            return
+        if path == "/api/maintenance":
+            try:
+                state = set_maintenance_state(payload.get("enabled"), payload.get("message", ""))
+            except ValueError as exc:
+                self.send_json(400, {"error": str(exc)})
+                return
+            logger.info("admin=%s action=maintenance_notice enabled=%s", session["username"], state["enabled"])
+            self.send_json(200, {"maintenance": state})
             return
 
         if path == "/api/users":
@@ -2259,25 +2486,27 @@ class AdminHandler(BaseHTTPRequestHandler):
 
         if path == "/api/clients":
             username = payload.get("username")
-            duration_hours = payload.get("durationHours")
-            duration_days_legacy = payload.get("durationDays")
-            # Client sends total seconds in durationHours.
-            # Legacy clients send days in durationDays.
-            if duration_hours is not None:
-                try:
-                    secs = int(float(duration_hours))
-                    duration_days = secs if secs > 0 else None
-                except (TypeError, ValueError):
-                    duration_days = None
-            elif duration_days_legacy is not None:
-                try:
-                    days = int(duration_days_legacy)
-                    duration_days = days * 86400 if days > 0 else None
-                except (TypeError, ValueError):
-                    duration_days = None
-            else:
-                duration_days = 30 * 86400
-            protocol = payload.get("protocol") or "wireguard"
+            provided_password = payload.get("password")
+            skip_password = payload.get("skipPassword", False)
+            try:
+                username = validate_client_name(username)
+                duration_days = parse_client_duration(payload)
+                protocol = payload.get("protocol", "wireguard") or "wireguard"
+                if not isinstance(protocol, str):
+                    raise ValueError("Unknown VPN protocol.")
+                protocol = protocol.lower()
+                if protocol not in {"wireguard", "xray", "ssh", "openvpn", "ipsec"}:
+                    raise ValueError("Unsupported VPN protocol.")
+                if not isinstance(skip_password, bool):
+                    raise ValueError("skipPassword must be true or false.")
+                if skip_password and provided_password is not None:
+                    raise ValueError("A password cannot be supplied when portal login is disabled.")
+                if provided_password is not None:
+                    validate_password(provided_password)
+            except ValueError as exc:
+                self.send_json(400, {"error": str(exc)})
+                return
+
             try:
                 if protocol == "xray":
                     client, config = create_xray_client(username, duration_days)
@@ -2287,8 +2516,10 @@ class AdminHandler(BaseHTTPRequestHandler):
                     client, config = create_openvpn_client(username, duration_days)
                 elif protocol == "ipsec":
                     client, config = create_ipsec_client(username, duration_days)
-                else:
+                elif protocol == "wireguard":
                     client, config = create_wireguard_client(username, duration_days)
+                else:
+                    raise ValueError("Unsupported VPN protocol.")
             except ValueError as exc:
                 self.send_json(400, {"error": str(exc)})
                 return
@@ -2297,8 +2528,6 @@ class AdminHandler(BaseHTTPRequestHandler):
                 self.send_json(503, {"error": str(exc)})
                 return
             # Apply user-supplied portal password (optional)
-            provided_password = payload.get("password")
-            skip_password = bool(payload.get("skipPassword"))
             try:
                 if skip_password:
                     with database() as conn:
@@ -2307,7 +2536,7 @@ class AdminHandler(BaseHTTPRequestHandler):
                             (client["id"],),
                         )
                     client["temporaryPassword"] = None
-                elif isinstance(provided_password, str) and len(provided_password) >= 4:
+                elif provided_password is not None:
                     salt = secrets.token_bytes(16)
                     pwh = password_digest(provided_password, salt)
                     with database() as conn:
@@ -2558,6 +2787,7 @@ def wireguard_expiry_worker():
     while True:
         try:
             expire_wireguard_clients()
+            expire_non_wireguard_clients()
         except Exception as exc:
             logger.warning("action=expire_vpn_clients error=%s", type(exc).__name__)
         time.sleep(30)

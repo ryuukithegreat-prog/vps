@@ -227,6 +227,34 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .adblock-toggle { min-height: 32px; padding: 0 10px; border: 1px solid var(--line-strong); border-radius: 4px; background: var(--paper); color: var(--teal); font-size: 10px; font-weight: 600; }
 .adblock-toggle:hover { border-color: var(--teal); background: #e7f1ed; }
 .adblock-toggle:disabled { cursor: wait; opacity: 0.55; }
+.adblock-settings { display: grid; grid-template-columns: minmax(180px, 0.65fr) minmax(240px, 1.35fr) auto; align-items: end; gap: 14px; margin-top: 16px; padding: 16px; border: 1px solid var(--line); background: var(--paper-muted); }
+.adblock-settings label { display: grid; gap: 7px; color: #3e4d46; font-size: 11px; font-weight: 600; }
+.adblock-settings select, .adblock-settings textarea { width: 100%; min-height: 40px; padding: 9px 10px; border: 1px solid var(--line-strong); border-radius: 4px; background: var(--paper); color: var(--ink); font: inherit; font-size: 11px; }
+.adblock-settings textarea { min-height: 86px; resize: vertical; line-height: 1.5; }
+.adblock-settings select:focus, .adblock-settings textarea:focus { border-color: var(--teal); outline: 2px solid rgba(19, 123, 113, 0.15); }
+.adblock-settings small { color: var(--quiet); font-size: 9px; font-weight: 400; line-height: 1.45; }
+.adblock-settings button { white-space: nowrap; }
+.maintenance-settings { grid-template-columns: 35px minmax(180px, 0.8fr) minmax(220px, 1.2fr); }
+.maintenance-editor { display: grid; justify-items: start; gap: 8px; }
+.maintenance-editor textarea { width: 100%; min-height: 72px; padding: 9px 10px; border: 1px solid var(--line-strong); border-radius: 4px; background: var(--paper); color: var(--ink); font: inherit; font-size: 11px; line-height: 1.5; resize: vertical; }
+.maintenance-editor textarea:focus { border-color: var(--teal); outline: 2px solid rgba(19, 123, 113, 0.15); }
+.maintenance-toggle { display: flex; align-items: center; gap: 7px; margin-top: 10px; color: var(--ink); font-size: 10px; }
+.maintenance-toggle input { accent-color: var(--teal); }
+.domain-guide { margin: 0 0 18px; padding: 18px; border: 1px solid var(--line); background: var(--paper); }
+.domain-guide-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+.domain-guide-heading h2 { margin: 0; font-size: 15px; font-weight: 600; }
+.domain-guide-heading p:not(.section-kicker) { margin: 5px 0 0; color: var(--muted); font-size: 10px; }
+.domain-current { display: grid; gap: 4px; color: var(--quiet); font-size: 9px; }
+.domain-current strong { max-width: 240px; overflow-wrap: anywhere; color: var(--ink); font-family: "IBM Plex Mono", monospace; font-size: 10px; font-weight: 500; }
+.domain-steps { display: grid; gap: 8px; margin: 16px 0; padding-left: 22px; color: var(--muted); font-size: 10px; line-height: 1.55; }
+.domain-steps code, .domain-command-result code { color: var(--ink); font-family: "IBM Plex Mono", monospace; font-size: 10px; overflow-wrap: anywhere; }
+.domain-command-builder { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(200px, 1fr) auto; align-items: end; gap: 10px; }
+.domain-command-builder > label { display: grid; gap: 6px; color: #3e4d46; font-size: 10px; font-weight: 600; }
+.domain-command-builder input { width: 100%; min-height: 38px; padding: 8px 10px; border: 1px solid var(--line-strong); border-radius: 4px; background: var(--paper); color: var(--ink); font: inherit; font-size: 11px; }
+.domain-command-builder input:focus { border-color: var(--teal); outline: 2px solid rgba(19, 123, 113, 0.15); }
+.domain-command-result { grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px; border: 1px solid var(--line); background: var(--paper-muted); }
+.domain-command-result code { min-width: 0; }
+.domain-guide-warning { margin: 12px 0 0; color: #87402f; font-size: 10px; line-height: 1.5; }
 .main-footer { display: flex; justify-content: space-between; gap: 12px; margin-top: 34px; padding: 13px 0 0; border-top: 1px solid var(--line); color: var(--quiet); font-family: "IBM Plex Mono", monospace; font-size: 9px; }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; clip-path: inset(50%); }
 
@@ -284,6 +312,14 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   .security-item { grid-template-columns: 25px minmax(120px, 1fr) auto; gap: 8px; }
   .adblock-security-item { grid-template-columns: 25px minmax(0, 1fr); }
   .adblock-control { grid-column: 2; justify-content: flex-start; margin-top: 4px; }
+  .adblock-settings { grid-template-columns: 1fr; gap: 12px; padding: 12px; }
+  .adblock-settings button { justify-self: start; }
+  .maintenance-settings { grid-template-columns: 25px minmax(0, 1fr); }
+  .maintenance-editor { grid-column: 2; width: 100%; }
+  .domain-guide { padding: 13px; }
+  .domain-guide-heading { flex-direction: column; gap: 10px; }
+  .domain-command-builder { grid-template-columns: 1fr; }
+  .domain-command-result { grid-column: 1; align-items: flex-start; flex-direction: column; }
   .security-item p { max-width: 180px; line-height: 1.4; }
   .security-item > strong { max-width: 105px; text-align: right; }
   .main-footer { font-size: 8px; }

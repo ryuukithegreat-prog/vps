@@ -13,7 +13,8 @@ if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
 fi
 
 DRY_RUN=0
-DOMAIN="vpn.example.com"
+DOMAIN="${VPN_DOMAIN:-}"
+DOMAIN_IS_IPV4=0
 EMAIL="admin@example.com"
 SSH_BANNER_MODE="1"
 ENABLE_UDPGW=1
@@ -30,7 +31,7 @@ usage() {
 Usage: $0 [options]
 
 Options:
-  --domain DOMAIN               Public domain used by the frontend and TLS testing (default: vpn.example.com)
+  --domain DOMAIN               Public domain; if omitted, detect this VPS's public IPv4
   --email EMAIL                 Email for certificate and admin notes
   --ssh-banner-mode MODE        SSH banner mode 1, 2, or 3 (default: 1)
   --disable-udpgw               Do not configure badvpn UDPGW support
@@ -111,8 +112,17 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ ! "$DOMAIN" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; then
-  fail "--domain must be a fully qualified domain name, for example vpn.example.com"
+if [[ -z "$DOMAIN" ]]; then
+  command -v curl >/dev/null 2>&1 || fail "Install curl or provide --domain to detect the VPS public IP."
+  DOMAIN="$(curl -4fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+  [[ -n "$DOMAIN" ]] || fail "Could not detect the VPS public IPv4; provide --domain."
+  log "No domain provided; using detected public IPv4 ${DOMAIN}."
+fi
+
+if python3 -c 'import ipaddress,sys; sys.exit(ipaddress.ip_address(sys.argv[1]).version != 4)' "$DOMAIN" 2>/dev/null; then
+  DOMAIN_IS_IPV4=1
+elif [[ ! "$DOMAIN" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]]; then
+  fail "--domain must be a fully qualified domain name or public IPv4 address."
 fi
 
 if [[ ! "$EMAIL" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
@@ -149,7 +159,7 @@ install_packages() {
   run_step "Installing Debian 12 packages" apt-get install -y \
     curl ca-certificates gnupg lsb-release openssl jq net-tools ufw nginx \
     certbot python3-certbot-nginx wireguard-tools openvpn strongswan dnsmasq \
-    dnsutils iproute2 whois  python3 python3-venv whiptail
+    dnsutils iproute2 whois easy-rsa python3 python3-venv whiptail
 }
 
 configure_kernel() {
@@ -182,6 +192,7 @@ configure_ufw() {
     ufw allow 500/udp comment "IPsec IKE"
     ufw allow 4500/udp comment "IPsec NAT-T"
     ufw route allow in on wg0 out on ${outbound_interface} from 10.42.0.0/24
+    ufw route allow in on tun0 out on ${outbound_interface} from 10.8.0.0/24
     ufw allow in on wg0 to 10.42.0.1 port 53 proto udp comment "VPN DNS"
     ufw allow in on wg0 to 10.42.0.1 port 53 proto tcp comment "VPN DNS"
     ${udpgw_rule}
@@ -230,6 +241,12 @@ domain_points_to_vps() {
   public_ip="$(curl -4fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
   [[ -n "$public_ip" ]] || return 1
 
+  if [[ "$DOMAIN_IS_IPV4" -eq 1 ]]; then
+    [[ "$DOMAIN" == "$public_ip" ]] && return 0
+    warn "Configured endpoint ${DOMAIN} does not match this VPS public IPv4 (${public_ip})."
+    return 1
+  fi
+
   while read -r resolved_ip; do
     [[ "$resolved_ip" == "$public_ip" ]] && return 0
   done < <(getent ahostsv4 "$DOMAIN" | awk '{print $1}' | sort -u)
@@ -241,6 +258,11 @@ domain_points_to_vps() {
 obtain_acme_certificate() {
   local cert_path="/etc/ssl/localcerts/${DOMAIN}.pem"
   local key_path="/etc/ssl/localcerts/${DOMAIN}.key"
+
+  if [[ "$DOMAIN_IS_IPV4" -eq 1 ]]; then
+    warn "Let's Encrypt issuance requires a domain name; retaining the self-signed IP certificate."
+    return 0
+  fi
 
   if ! domain_points_to_vps; then
     warn "Skipping Let's Encrypt issuance. Point DNS to this VPS before retrying."
@@ -261,6 +283,13 @@ obtain_acme_certificate() {
 generate_self_signed_cert() {
   local cert_path="/etc/ssl/localcerts/${DOMAIN}.pem"
   local key_path="/etc/ssl/localcerts/${DOMAIN}.key"
+  local subject_alt_name
+
+  if [[ "$DOMAIN_IS_IPV4" -eq 1 ]]; then
+    subject_alt_name="IP:${DOMAIN}"
+  else
+    subject_alt_name="DNS:${DOMAIN},DNS:www.${DOMAIN}"
+  fi
 
   if [[ -f "$cert_path" && -f "$key_path" ]]; then
     return 0
@@ -270,7 +299,7 @@ generate_self_signed_cert() {
     -keyout "$key_path" \
     -out "$cert_path" \
     -subj "/CN=${DOMAIN}" \
-    -addext "subjectAltName=DNS:${DOMAIN},DNS:www.${DOMAIN},IP:127.0.0.1" \
+    -addext "subjectAltName=${subject_alt_name},IP:127.0.0.1" \
     >/dev/null 2>&1 || fail "Failed to generate self-signed certificate for ${DOMAIN}"
 
   chmod 600 "$key_path"
@@ -391,11 +420,11 @@ EOF
 
   cat > /etc/systemd/system/vpn-status-refresh.timer <<'EOF'
 [Unit]
-Description=Refresh VPN node status every 30 seconds
+Description=Refresh VPN node status every 5 seconds
 
 [Timer]
 OnBootSec=10s
-OnUnitActiveSec=30s
+OnUnitActiveSec=5s
 AccuracySec=1s
 Unit=vpn-status-refresh.service
 
@@ -464,6 +493,11 @@ EOF
 }
 
 configure_nginx_frontend() {
+  local server_names="$DOMAIN"
+  if [[ "$DOMAIN_IS_IPV4" -eq 0 ]]; then
+    server_names+=" www.${DOMAIN}"
+  fi
+
   cat > /etc/nginx/conf.d/vpn_handshake_map.conf <<'EOF'
 map "$server_protocol:$http_upgrade" $chkdarkmaster_handshake {
     default 0;
@@ -475,7 +509,7 @@ EOF
 server {
     listen 80;
     listen [::]:80;
-    server_name ${DOMAIN} www.${DOMAIN};
+    server_name ${server_names};
 
     location / {
         return 301 https://\$host\$request_uri;
@@ -485,7 +519,7 @@ server {
 server {
   listen 443 ssl;
   listen [::]:443 ssl;
-    server_name ${DOMAIN} www.${DOMAIN};
+    server_name ${server_names};
 
     ssl_certificate /etc/ssl/localcerts/${DOMAIN}.pem;
     ssl_certificate_key /etc/ssl/localcerts/${DOMAIN}.key;
@@ -652,6 +686,22 @@ record_error() {
   mv "$temporary" "$STATE"
 }
 
+case "$(jq -r '.level // "balanced"' "$STATE")" in
+  light)
+    SOURCE=https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts
+    ;;
+  balanced)
+    SOURCE=https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/fakenews-gambling/hosts
+    ;;
+  strict)
+    SOURCE=https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/fakenews-gambling-porn/hosts
+    ;;
+  *)
+    record_error
+    exit 1
+    ;;
+esac
+
 raw="$(mktemp /var/lib/vpnfront/adblock-raw.XXXXXX)"
 candidate="$(mktemp /var/lib/vpnfront/ads-candidate.XXXXXX)"
 backup="$(mktemp /var/lib/vpnfront/ads-backup.XXXXXX)"
@@ -675,6 +725,16 @@ if ! awk '
   record_error
   exit 1
 fi
+
+jq -r '.blocked_domains[]? | select(type == "string")' "$STATE" | awk '
+  {
+    host = tolower($0)
+    if (length(host) <= 253 && host ~ /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/) {
+      print "0.0.0.0 " host
+    }
+  }
+' >>"$candidate"
+sort -u "$candidate" -o "$candidate"
 
 host_count="$(wc -l <"$candidate")"
 if (( host_count < 100 || host_count > 2000000 )); then
@@ -734,35 +794,94 @@ EOF
 }
 
 configure_openvpn() {
-  cat > /etc/openvpn/server.conf <<EOF
+  local easy_rsa_dir=/etc/openvpn/easy-rsa
+  local server_dir=/etc/openvpn/server
+  local outbound_interface
+  outbound_interface="$(ip -4 route show default | awk 'NR == 1 {print $5}')"
+  [[ "$outbound_interface" =~ ^[[:alnum:]_.:-]+$ ]] || fail "Could not determine the VPS outbound network interface."
+
+  mkdir -p "$easy_rsa_dir" "$server_dir"
+  if [[ ! -x "$easy_rsa_dir/easyrsa" ]]; then
+    cp -a /usr/share/easy-rsa/. "$easy_rsa_dir/"
+  fi
+  (
+    cd "$easy_rsa_dir"
+    if [[ ! -f pki/ca.crt ]]; then
+      ./easyrsa --batch init-pki
+      EASYRSA_REQ_CN="${DOMAIN} VPN CA" ./easyrsa --batch build-ca nopass
+    fi
+    if [[ ! -f pki/issued/server.crt || ! -f pki/private/server.key ]]; then
+      EASYRSA_REQ_CN="${DOMAIN}" ./easyrsa --batch build-server-full server nopass
+    fi
+    if [[ ! -f pki/dh.pem ]]; then
+      ./easyrsa gen-dh
+    fi
+    if [[ ! -f pki/crl.pem ]]; then
+      ./easyrsa --batch gen-crl
+    fi
+  ) || fail "OpenVPN certificate authority initialization failed."
+
+  install -m 0644 "$easy_rsa_dir/pki/ca.crt" /etc/openvpn/ca.crt
+  install -m 0644 "$easy_rsa_dir/pki/ca.crt" "$server_dir/ca.crt"
+  install -m 0644 "$easy_rsa_dir/pki/issued/server.crt" "$server_dir/server.crt"
+  install -m 0600 "$easy_rsa_dir/pki/private/server.key" "$server_dir/server.key"
+  install -m 0600 "$easy_rsa_dir/pki/dh.pem" "$server_dir/dh.pem"
+  install -m 0600 "$easy_rsa_dir/pki/crl.pem" "$server_dir/crl.pem"
+  if [[ ! -f /etc/openvpn/ta.key ]]; then
+    openvpn --genkey secret /etc/openvpn/ta.key || fail "Could not generate the OpenVPN tls-auth key."
+  fi
+  install -m 0600 /etc/openvpn/ta.key "$server_dir/ta.key"
+
+  cat > /usr/local/sbin/vpn-openvpn-up <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+iptables -C FORWARD -i tun0 -o ${outbound_interface} -j ACCEPT 2>/dev/null || iptables -A FORWARD -i tun0 -o ${outbound_interface} -j ACCEPT
+iptables -C FORWARD -i ${outbound_interface} -o tun0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i ${outbound_interface} -o tun0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+iptables -t nat -C POSTROUTING -s 10.8.0.0/24 -o ${outbound_interface} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o ${outbound_interface} -j MASQUERADE
+EOF
+  cat > /usr/local/sbin/vpn-openvpn-down <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+iptables -D FORWARD -i tun0 -o ${outbound_interface} -j ACCEPT 2>/dev/null || true
+iptables -D FORWARD -i ${outbound_interface} -o tun0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+iptables -t nat -D POSTROUTING -s 10.8.0.0/24 -o ${outbound_interface} -j MASQUERADE 2>/dev/null || true
+EOF
+  chmod 0750 /usr/local/sbin/vpn-openvpn-up /usr/local/sbin/vpn-openvpn-down
+
+  cat > "$server_dir/server.conf" <<EOF
 port ${DEFAULT_OVPN_PORT}
 proto udp
 dev tun
-ca /etc/openvpn/ca.crt
-cert /etc/openvpn/server.crt
-key /etc/openvpn/server.key
-dh /etc/openvpn/dh.pem
+topology subnet
+ca ${server_dir}/ca.crt
+cert ${server_dir}/server.crt
+key ${server_dir}/server.key
+dh ${server_dir}/dh.pem
+crl-verify ${server_dir}/crl.pem
+tls-auth ${server_dir}/ta.key 0
+tls-version-min 1.2
+data-ciphers AES-256-GCM:AES-128-GCM
+auth SHA256
 server 10.8.0.0 255.255.255.0
+push "redirect-gateway def1 bypass-dhcp"
+push "dhcp-option DNS 1.1.1.1"
+push "dhcp-option DNS 9.9.9.9"
 keepalive 10 120
 persist-key
 persist-tun
+script-security 2
+up /usr/local/sbin/vpn-openvpn-up
+down /usr/local/sbin/vpn-openvpn-down
 status /var/log/openvpn-status.log
 verb 3
 EOF
 
-  if [[ ! -f /etc/openvpn/server.key ]]; then
-    openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
-      -keyout /etc/openvpn/server.key \
-      -out /etc/openvpn/server.crt \
-      -subj "/CN=${DOMAIN}" >/dev/null 2>&1 || true
-    cp /etc/openvpn/server.crt /etc/openvpn/ca.crt
-    openssl dhparam -out /etc/openvpn/dh.pem 2048 >/dev/null 2>&1 || true
-  fi
-
-  if systemctl list-unit-files | grep -q '^openvpn.service'; then
-    systemctl enable --now openvpn || true
+  if systemctl list-unit-files --type=service --no-legend | awk '$1 == "openvpn-server@.service" { found=1 } END { exit !found }'; then
+    systemctl enable --now openvpn-server@server.service || fail "OpenVPN server failed to start."
+  elif systemctl list-unit-files --type=service --no-legend | awk '$1 == "openvpn@.service" { found=1 } END { exit !found }'; then
+    systemctl enable --now openvpn@server.service || fail "OpenVPN server failed to start."
   else
-    systemctl enable --now openvpn-server@server || true
+    fail "No supported OpenVPN systemd template was found."
   fi
 }
 
@@ -774,6 +893,8 @@ config setup
 
 conn %default
     keyexchange=ikev2
+  rightauth=eap-mschapv2
+  eap_identity=%identity
     ike=aes256-sha256-modp2048!
     esp=aes256-sha256!
     dpdaction=clear
@@ -799,7 +920,7 @@ conn vpn-${DOMAIN}
 EOF
 
   cat > /etc/ipsec.secrets <<EOF
-: RSA "${DOMAIN}"
+: RSA /etc/ssl/localcerts/${DOMAIN}.key
 EOF
 
   chmod 600 /etc/ipsec.secrets
@@ -814,7 +935,7 @@ Description=Restart VPN frontend services
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c 'for unit in nginx wg-quick@wg0 openvpn strongswan udpgw; do /bin/systemctl restart "$unit" || true; done'
+ExecStart=/bin/sh -c 'for unit in nginx wg-quick@wg0 openvpn-server@server strongswan-starter udpgw; do /bin/systemctl restart "$unit" || true; done'
 EOF
 
   cat > /etc/systemd/system/vpnfront-restart.timer <<'EOF'

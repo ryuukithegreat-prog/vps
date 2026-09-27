@@ -363,9 +363,11 @@ function renderAdblock(stateData) {
   const enabled = stateData?.enabled === true;
   const count = Number(stateData?.hostCount) || 0;
   const toggle = byId('adblockToggle');
+  byId('adblockLevel').value = stateData?.level || 'balanced';
+  byId('blockedDomains').value = (stateData?.blockedDomains || []).join('\n');
   byId('adblockStatus').textContent = enabled ? 'On' : 'Off';
   byId('adblockSummary').textContent = enabled
-    ? `VPN clients only · ${count.toLocaleString()} blocked hosts`
+    ? `VPN clients only · ${count.toLocaleString()} blocked hosts · ${stateData?.blockedDomains?.length || 0} custom domains`
     : 'VPN clients only · filtered resolver is off';
   byId('adblockDetails').textContent = stateData?.lastError
     ? `Last update error: ${stateData.lastError}`
@@ -375,6 +377,7 @@ function renderAdblock(stateData) {
   toggle.textContent = enabled ? 'Disable' : 'Enable';
   toggle.setAttribute('aria-pressed', String(enabled));
   toggle.disabled = state.requestPending;
+  byId('saveAdblockSettingsButton').disabled = state.requestPending;
 }
 
 async function loadAdblock() {
@@ -397,8 +400,61 @@ async function toggleAdblock() {
     renderAdblock(response.adblock);
     setNotice(`VPN DNS ad blocking ${enabled ? 'enabled' : 'disabled'}.`);
   } catch (error) {
-    renderAdblock({ enabled: !enabled, lastError: error.message });
     setNotice(error.message, true);
+    await loadAdblock();
+  }
+}
+
+async function saveAdblockSettings() {
+  const button = byId('saveAdblockSettingsButton');
+  const blockedDomains = [...new Set(byId('blockedDomains').value
+    .split(/[\n,]+/)
+    .map((domain) => domain.trim().toLowerCase())
+    .filter(Boolean))];
+  button.disabled = true;
+  try {
+    const response = await api('/api/adblock', {
+      method: 'POST',
+      body: {
+        enabled: byId('adblockToggle').getAttribute('aria-pressed') === 'true',
+        level: byId('adblockLevel').value,
+        blockedDomains,
+      },
+    });
+    renderAdblock(response.adblock);
+    setNotice('DNS filtering settings saved.');
+  } catch (error) {
+    setNotice(error.message, true);
+    await loadAdblock();
+  } finally {
+    button.disabled = state.requestPending;
+  }
+}
+
+async function loadMaintenance() {
+  const response = await api('/api/maintenance');
+  byId('maintenanceEnabled').checked = response.maintenance.enabled;
+  byId('maintenanceMessage').value = response.maintenance.message;
+}
+
+async function saveMaintenance() {
+  const button = byId('saveMaintenanceButton');
+  button.disabled = true;
+  try {
+    const response = await api('/api/maintenance', {
+      method: 'POST',
+      body: {
+        enabled: byId('maintenanceEnabled').checked,
+        message: byId('maintenanceMessage').value,
+      },
+    });
+    byId('maintenanceEnabled').checked = response.maintenance.enabled;
+    byId('maintenanceMessage').value = response.maintenance.message;
+    setNotice('Client portal maintenance notice saved.');
+  } catch (error) {
+    setNotice(error.message, true);
+  } finally {
+    button.disabled = state.requestPending;
   }
 }
 
@@ -413,6 +469,7 @@ function renderStatus() {
 
   byId('domainLabel').textContent = domain;
   byId('workspaceDomain').textContent = domain;
+  byId('domainGuideCurrent').textContent = domain;
   byId('nodeHealth').className = `health-badge ${stale ? 'is-stale' : activeServices === services.length ? 'is-online' : activeServices ? 'is-stale' : 'is-offline'}`;
   byId('nodeHealthLabel').textContent = stale ? 'Stale report' : activeServices === services.length ? 'Operational' : activeServices ? 'Degraded' : 'No services online';
   byId('sidebarStatus').textContent = stale ? 'Telemetry stale' : 'Connected';
@@ -423,6 +480,35 @@ function renderStatus() {
   renderSessions();
   renderSecurity();
   loadAdblock();
+  loadMaintenance().catch((error) => setNotice(error.message, true));
+}
+
+function buildDomainSetupCommand() {
+  const hostname = byId('setupDomainInput').value.trim().toLowerCase();
+  const email = byId('setupEmailInput').value.trim();
+  const ipv4 = hostname.split('.').length === 4 && hostname.split('.').every((part) => /^(0|[1-9]\d{0,2})$/.test(part) && Number(part) <= 255);
+  const domain = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/.test(hostname);
+  if (!ipv4 && !domain) {
+    setNotice('Enter a valid domain name or IPv4 address.', true);
+    byId('setupDomainInput').focus();
+    return;
+  }
+  if (!/^[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}$/.test(email)) {
+    setNotice('Enter a valid certificate email address.', true);
+    byId('setupEmailInput').focus();
+    return;
+  }
+  byId('domainCommandText').textContent = `sudo ./setup-vpn-stack.sh --domain ${hostname} --email ${email}`;
+  byId('domainCommandResult').hidden = false;
+}
+
+async function copyDomainSetupCommand() {
+  try {
+    await navigator.clipboard.writeText(byId('domainCommandText').textContent);
+    setNotice('Installer command copied. Run it only on a fresh VPS.');
+  } catch {
+    setNotice('Clipboard access is unavailable. Select and copy the command.', true);
+  }
 }
 
 function markUnavailable() {
@@ -612,11 +698,11 @@ async function createAdmin(event) {
   }
 }
 
-function downloadConfig(username, config) {
+function downloadConfig(filename, config) {
   const blobUrl = URL.createObjectURL(new Blob([config], { type: 'text/plain;charset=utf-8' }));
   const link = document.createElement('a');
   link.href = blobUrl;
-  link.download = `${username}.conf`;
+  link.download = filename;
   document.body.append(link);
   link.click();
   link.remove();
@@ -627,6 +713,7 @@ function renderVPNClients(clients) {
   const list = byId('clientList');
   list.replaceChildren();
   for (const client of clients) {
+    const isWireGuard = client.protocol === 'wireguard';
     const row = document.createElement('article');
     row.className = 'client-row';
     const heading = document.createElement('div');
@@ -634,8 +721,8 @@ function renderVPNClients(clients) {
     const name = document.createElement('h4');
     name.textContent = client.username;
     const status = document.createElement('span');
-    status.className = `client-state is-${client.status}`;
-    status.textContent = client.status === 'connected' ? 'Connected' : client.status === 'expired' ? 'Expired' : 'Idle';
+    status.className = `client-state is-${client.status || 'active'}`;
+    status.textContent = client.status === 'connected' ? 'Connected' : client.status === 'expired' ? 'Expired' : client.status === 'active' ? 'Active' : 'Idle';
     heading.append(name, status);
 
     const details = document.createElement('dl');
@@ -645,10 +732,16 @@ function renderVPNClients(clients) {
       ['Server endpoint', client.endpoint || 'No endpoint observed'],
       ['Account age', formatDuration(client.ageSeconds)],
       ['Access remaining', client.remainingSeconds === null ? 'No expiry' : formatDuration(client.remainingSeconds)],
-      ['Uploaded', formatBytes(client.bytesReceived)],
-      ['Downloaded', formatBytes(client.bytesSent)],
-      ['Last handshake', relativeClientTime(client.lastHandshake)],
     ];
+    if (isWireGuard) {
+      fields.push(
+        ['Uploaded', formatBytes(client.bytesReceived)],
+        ['Downloaded', formatBytes(client.bytesSent)],
+        ['Last handshake', relativeClientTime(client.lastHandshake)],
+      );
+    } else {
+      fields.push(['Live traffic', 'Not reported by this protocol']);
+    }
     for (const [label, value] of fields) {
       const item = document.createElement('div');
       const term = document.createElement('dt');
@@ -685,13 +778,6 @@ function renderVPNClients(clients) {
 }
 
 async function loadVPNClients() {
-  try {
-    const __snap = await api('/api/clients', { csrf: false });
-    const __json = JSON.stringify((__snap && __snap.clients) || []);
-    if (__json === window.__lastClientsJson) return;
-    window.__lastClientsJson = __json;
-  } catch (e) { /* fall through on error */ }
-
   if (state.clientsPending) return;
   state.clientsPending = true;
   try {
@@ -728,7 +814,7 @@ async function createVPNClient(event) {
       body: { username: byId('newClientUsername').value.trim(), durationHours: (typeof readDuration === 'function' ? readDuration() : 2592000),
               protocol: (form.protocol && form.protocol.value) || 'wireguard'},
     });
-    state.createdClientConfig = { username: response.client.username, config: response.config, temporaryPassword: response.client.temporaryPassword };
+    state.createdClientConfig = { ...response.client, config: response.config };
     byId('clientConfigTitle').textContent = `${response.client.username} created`;
     byId('clientConfigCopy').textContent = `VPN address ${response.client.address} · ${response.client.expiresAt ? `expires ${formatClientDate(response.client.expiresAt)}` : 'no expiry'}.`;
     byId('createdPortalUsername').textContent = response.client.username;
@@ -753,18 +839,22 @@ async function downloadVPNClientConfig(client) {
   try {
     const __cid = encodeURIComponent(client.id);
     const __resp = await fetch(`/api/clients/${__cid}/config`, { credentials: 'same-origin', cache: 'no-store' });
-    if (!__resp.ok) {
-      const err = await __resp.text().catch(() => '');
-      throw new Error(err || ('HTTP ' + __resp.status));
-    }
     const config = await __resp.text();
+    if (!__resp.ok) {
+      let message = `Request failed (${__resp.status}).`;
+      try { message = JSON.parse(config).error || message; } catch {}
+      throw new Error(message);
+    }
     const __disp = __resp.headers.get('Content-Disposition') || '';
     const __m = /filename="?([^"]+)"?/i.exec(__disp);
-    const __fname = __m ? __m[1] : (client.username + '.conf');
-    downloadConfig(client.username, config);
-    setNotice(`Downloaded WireGuard config for ${client.username}. Keep it private.`);
+    const extension = { wireguard: 'conf', openvpn: 'ovpn', ipsec: 'txt', ikev2: 'txt' }[client.protocol] || 'txt';
+    const __fname = __m ? __m[1] : `${client.username}.${extension}`;
+    downloadConfig(__fname, config);
+    setNotice(`Downloaded ${protocolLabel(client.protocol)} configuration for ${client.username}. Keep it private.`);
+    return true;
   } catch (error) {
     setNotice(error.message, true);
+    return false;
   }
 }
 
@@ -806,10 +896,34 @@ async function resetVPNClientPassword(client) {
 
 function downloadCreatedClientConfig() {
   if (!state.createdClientConfig?.config) return;
-  downloadConfig(state.createdClientConfig.username, state.createdClientConfig.config);
-  setNotice(`Downloaded WireGuard config for ${state.createdClientConfig.username}. Keep it private.`);
+  const client = state.createdClientConfig;
+  if (client.id) {
+    downloadVPNClientConfig(client).then((downloaded) => {
+      if (downloaded) byId('clientConfigDialog').close();
+    });
+    return;
+  }
+  const extension = { wireguard: 'conf', openvpn: 'ovpn', ipsec: 'txt', ikev2: 'txt' }[client.protocol] || 'txt';
+  downloadConfig(`${client.username}.${extension}`, client.config);
   byId('clientConfigDialog').close();
 }
+
+window.showCreatedClient = function (response) {
+  const client = response.client;
+  state.createdClientConfig = { ...client, config: response.config };
+  byId('clientConfigTitle').textContent = `${client.username} created`;
+  byId('clientConfigCopy').textContent = `${protocolLabel(client.protocol)} access${client.expiresAt ? ` expires ${formatClientDate(client.expiresAt)}` : ' does not expire'}. Share credentials privately.`;
+  byId('createdPortalUsername').textContent = client.username;
+  byId('createdPortalPassword').textContent = client.temporaryPassword || 'Portal login disabled';
+  byId('copyCreatedPasswordButton').hidden = !client.temporaryPassword;
+  byId('createdConfigHint').textContent = client.temporaryPassword
+    ? 'Share the portal password separately from the VPN configuration.'
+    : 'Portal sign-in is disabled for this VPN account.';
+  const extension = { wireguard: 'conf', openvpn: 'ovpn', ipsec: 'txt', ikev2: 'txt' }[client.protocol] || 'txt';
+  byId('downloadCreatedConfigButton').textContent = `Download .${extension}`;
+  byId('downloadCreatedConfigButton').hidden = !response.config;
+  byId('clientConfigDialog').showModal();
+};
 
 function openRestartDialog() {
   const service = services.find((entry) => entry.key === state.selectedService);
@@ -880,6 +994,10 @@ byId('clientConfigDialog').addEventListener('close', () => {
 byId('refreshButton').addEventListener('click', refreshStatus);
 byId('retryButton').addEventListener('click', refreshStatus);
 byId('adblockToggle').addEventListener('click', toggleAdblock);
+byId('saveAdblockSettingsButton').addEventListener('click', saveAdblockSettings);
+byId('saveMaintenanceButton').addEventListener('click', saveMaintenance);
+byId('buildDomainCommand').addEventListener('click', buildDomainSetupCommand);
+byId('copyDomainCommand').addEventListener('click', copyDomainSetupCommand);
 byId('refreshRate').addEventListener('change', configureRefresh);
 byId('serviceSearch').addEventListener('input', renderServices);
 byId('serviceFilter').addEventListener('change', renderServices);

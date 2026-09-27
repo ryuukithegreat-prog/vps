@@ -47,6 +47,32 @@ check_cert() {
   /usr/local/bin/vpn-cert-check "${DOMAIN:-vpn.example.com}" 443 || true
 }
 
+show_domain_guide() {
+  local domain="${DOMAIN:-}"
+  echo "==== Domain and TLS setup ===="
+  if [[ -n "$domain" ]]; then
+    printf 'Configured host: %s\n' "$domain"
+    printf 'DNS A records:\n'
+    getent ahostsv4 "$domain" | awk '!seen[$1]++ { print "  " $1 }' || true
+    /usr/local/bin/vpn-cert-check "$domain" 443 || true
+  else
+    echo "No DOMAIN is present in /etc/vpnfront/.env."
+  fi
+  cat <<'GUIDE'
+
+For a fresh Debian 12 VPS:
+1. Point a DNS A record for your hostname to the VPS public IPv4.
+2. Check the address on the VPS with: curl -4 https://api.ipify.org
+3. Wait for DNS to resolve: getent ahostsv4 your.domain
+4. Run the installer from its project directory:
+   sudo ./setup-vpn-stack.sh --domain your.domain --email admin@your.domain
+
+An IP-based install uses a self-signed certificate. A public domain that resolves
+to this VPS is required for Let's Encrypt. Do not rerun the installer on a live
+VPS just to change its host; domain migration needs coordinated service changes.
+GUIDE
+}
+
 check_web_routes() {
   local domain="${DOMAIN:-}"
   if [[ -z "$domain" ]]; then
@@ -80,19 +106,59 @@ show_adblock() {
 
 toggle_adblock() {
   local choice="${1:-}"
+  local config=/etc/dnsmasq.d/vpnfront-adblock.conf
+  local state=/var/lib/vpnfront/adblock.json
+  local config_backup state_backup config_tmp state_tmp had_config=0 had_state=0
+  config_backup="$(mktemp /etc/dnsmasq.d/vpnfront-adblock.backup.XXXXXX)"
+  state_backup="$(mktemp /var/lib/vpnfront/adblock.backup.XXXXXX)"
+  config_tmp="$(mktemp /etc/dnsmasq.d/vpnfront-adblock.tmp.XXXXXX)"
+  state_tmp="$(mktemp /var/lib/vpnfront/adblock.tmp.XXXXXX)"
+  if [[ -f "$config" ]]; then
+    cp -p "$config" "$config_backup"
+    had_config=1
+  fi
+  if [[ -f "$state" ]]; then
+    cp -p "$state" "$state_backup"
+    had_state=1
+  fi
+
   case "$choice" in
     on)
-      printf 'addn-hosts=/var/lib/vpnfront/ads.hosts\n' >/etc/dnsmasq.d/vpnfront-adblock.conf
-      dnsmasq --test && systemctl reload dnsmasq
-      jq '.enabled = true' /var/lib/vpnfront/adblock.json >/var/lib/vpnfront/adblock.json.tmp && mv /var/lib/vpnfront/adblock.json.tmp /var/lib/vpnfront/adblock.json
+      printf 'addn-hosts=/var/lib/vpnfront/ads.hosts\n' >"$config_tmp"
+      chmod 600 "$config_tmp"
+      mv "$config_tmp" "$config"
       ;;
     off)
-      rm -f /etc/dnsmasq.d/vpnfront-adblock.conf
-      dnsmasq --test && systemctl reload dnsmasq
-      jq '.enabled = false' /var/lib/vpnfront/adblock.json >/var/lib/vpnfront/adblock.json.tmp && mv /var/lib/vpnfront/adblock.json.tmp /var/lib/vpnfront/adblock.json
+      rm -f "$config"
       ;;
-    *) echo "Usage: $0 adblock {status|on|off}"; return 1 ;;
+    *)
+      rm -f "$config_backup" "$state_backup" "$config_tmp" "$state_tmp"
+      echo "Usage: $0 adblock {status|on|off}"
+      return 1
+      ;;
   esac
+
+  if ! dnsmasq --test || ! systemctl reload dnsmasq; then
+    if (( had_config )); then mv "$config_backup" "$config"; else rm -f "$config"; fi
+    if (( had_state )); then mv "$state_backup" "$state"; else rm -f "$state"; fi
+    systemctl reload dnsmasq >/dev/null 2>&1 || true
+    rm -f "$config_backup" "$state_backup" "$config_tmp" "$state_tmp"
+    echo "[ERROR] Ad-block configuration was rejected; previous state restored." >&2
+    return 1
+  fi
+
+  if ! jq --argjson enabled "$([[ "$choice" == on ]] && printf true || printf false)" \
+    '.enabled = $enabled' "$state" >"$state_tmp"; then
+    if (( had_config )); then mv "$config_backup" "$config"; else rm -f "$config"; fi
+    if (( had_state )); then mv "$state_backup" "$state"; else rm -f "$state"; fi
+    systemctl reload dnsmasq >/dev/null 2>&1 || true
+    rm -f "$config_backup" "$state_backup" "$config_tmp" "$state_tmp"
+    echo "[ERROR] Could not update ad-block state; previous state restored." >&2
+    return 1
+  fi
+  chmod 600 "$state_tmp"
+  mv "$state_tmp" "$state"
+  rm -f "$config_backup" "$state_backup" "$config_tmp"
   show_adblock
 }
 
@@ -119,6 +185,7 @@ while [[ $# -gt 0 ]]; do
     status) show_status; exit 0 ;;
     protocols) show_protocols; exit 0 ;;
     cert) check_cert; exit 0 ;;
+    domain) show_domain_guide; exit 0 ;;
     webcheck) check_web_routes; exit $? ;;
     logs) show_recent_logs; exit 0 ;;
     restart) restart_all; exit 0 ;;
@@ -126,10 +193,10 @@ while [[ $# -gt 0 ]]; do
       case "${2:-status}" in
         status) show_adblock ;;
         on|off) toggle_adblock "$2" ;;
-        *) echo "Usage: $0 {status|protocols|cert|webcheck|logs|restart|adblock {status|on|off}}"; exit 1 ;;
+        *) echo "Usage: $0 {status|protocols|cert|domain|webcheck|logs|restart|adblock {status|on|off}}"; exit 1 ;;
       esac
       exit $? ;;
-    *) echo "Usage: $0 {status|protocols|cert|webcheck|logs|restart|adblock {status|on|off}}"; exit 1 ;;
+    *) echo "Usage: $0 {status|protocols|cert|domain|webcheck|logs|restart|adblock {status|on|off}}"; exit 1 ;;
   esac
 done
 
@@ -144,6 +211,7 @@ VPN Management Console
 7) Disable VPN DNS ad blocking
 8) Check frontend and API routes
 9) Show recent service logs
+10) Domain and TLS setup guide
 0) Exit
 MENU
 
@@ -163,6 +231,7 @@ while true; do
     7) toggle_adblock off ;;
     8) check_web_routes ;;
     9) show_recent_logs ;;
+    10) show_domain_guide ;;
     0) exit 0 ;;
     *) echo "Invalid option" ;;
   esac

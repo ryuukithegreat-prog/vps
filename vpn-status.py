@@ -10,9 +10,9 @@ from pathlib import Path
 
 def run(args):
     try:
-        result = subprocess.run(args, capture_output=True, text=True, check=False)
+        result = subprocess.run(args, capture_output=True, text=True, timeout=5, check=False)
         return result.stdout.strip() if result.returncode == 0 else ""
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return ""
 
 
@@ -63,6 +63,14 @@ def parse_ipsec():
     output = run(["ipsec", "statusall"])
     count = sum(1 for line in output.splitlines() if "ESTABLISHED" in line)
     return {"active_tunnels": count}
+
+
+def parse_ssh_sessions(output):
+    return sum(
+        1
+        for line in output.splitlines()
+        if len(line.split()) >= 5 and line.split()[1].startswith(("pts/", "tty"))
+    )
 
 
 def parse_openvpn():
@@ -124,6 +132,7 @@ def main():
             "wireguard": parse_wg(),
             "ipsec": parse_ipsec(),
             "openvpn": parse_openvpn(),
+            "ssh": {"active_clients": parse_ssh_sessions(run(["who"]))},
             "services": services,
             "service_units": service_units,
             "firewall": parse_ufw(),
@@ -142,6 +151,7 @@ def main():
         payload["protocols"]["wireguard"]["active_clients"]
         + payload["protocols"]["openvpn"]["active_clients"]
         + payload["protocols"]["ipsec"]["active_tunnels"]
+        + payload["protocols"]["ssh"]["active_clients"]
     )
     payload["summary"]["banned_count"] = len(payload["banned_users"])
     print(json.dumps(payload, indent=2))

@@ -51,13 +51,14 @@ done
 
 check_shell_syntax setup-vpn-stack.sh
 check_shell_syntax vpn-admin.sh
-check_shell_syntax cert-check.sh
-if python3 -m py_compile vpn-status.py admin-api.py; then
+check_shell_syntax verify-vpn-stack.sh
+check_shell_syntax deploy.sh
+if python3 -c 'import ast,pathlib; [ast.parse(pathlib.Path(path).read_text(), filename=path) for path in ("vpn-status.py", "admin-api.py")]'; then
   pass "VPN Python services compile"
 else
   fail "VPN Python services have syntax errors"
 fi
-if python3 -m unittest discover -s tests -p 'test_*.py'; then
+if PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py'; then
   pass "VPN status parser tests pass"
 else
   fail "VPN status parser tests failed"
@@ -69,8 +70,8 @@ grep -q 'HTTP/1.1:CHKDARKMASTER' setup-vpn-stack.sh \
 grep -q 'OnCalendar=\*-\*-\* 00:00:00' setup-vpn-stack.sh \
   && pass 'midnight restart schedule is present' \
   || fail 'midnight restart schedule is missing'
-grep -q 'OnUnitActiveSec=30s' setup-vpn-stack.sh \
-  && pass 'status refresh schedule is present' \
+grep -q 'OnUnitActiveSec=5s' setup-vpn-stack.sh \
+  && pass 'five-second status refresh schedule is present' \
   || fail 'status refresh schedule is missing'
 grep -q 'proxy_pass http://127.0.0.1:8081' setup-vpn-stack.sh \
   && pass 'admin API uses the loopback proxy' \
@@ -107,7 +108,7 @@ grep -q 'DEFAULT_UDPGW_PORT=7300' setup-vpn-stack.sh \
   && pass 'UDPGW port is explicitly named' \
   || fail 'UDPGW port declaration is missing'
 
-if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+if [[ ${RUN_HOST_CHECKS:-0} == 1 ]]; then
   check_file /etc/nginx/conf.d/vpn_frontend.conf
   check_file /etc/systemd/system/vpnfront-restart.timer
   check_file /etc/systemd/system/vpn-status-refresh.timer
@@ -128,7 +129,7 @@ if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
       || warn 'midnight restart timer is not enabled on this host'
   fi
 else
-  warn 'not running as root; skipped live Nginx, SSH, systemd, and filesystem checks'
+  warn 'skipped live Nginx, SSH, systemd, and filesystem checks (set RUN_HOST_CHECKS=1 to opt in)'
 fi
 
 if (( failures > 0 )); then

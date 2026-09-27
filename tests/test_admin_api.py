@@ -29,6 +29,7 @@ class AdminApiTests(unittest.TestCase):
         self.original_adblock_config_path = admin_api.ADBLOCK_CONFIG_PATH
         self.original_adblock_hosts_path = admin_api.ADBLOCK_HOSTS_PATH
         self.original_adblock_state_path = admin_api.ADBLOCK_STATE_PATH
+        self.original_maintenance_state_path = admin_api.MAINTENANCE_STATE_PATH
         admin_api.DB_PATH = Path(self.temp_dir.name) / "admins.sqlite3"
         admin_api.STATUS_PATH = Path(self.temp_dir.name) / "status.json"
         admin_api.WG_CONFIG_PATH = Path(self.temp_dir.name) / "wg0.conf"
@@ -36,6 +37,7 @@ class AdminApiTests(unittest.TestCase):
         admin_api.ADBLOCK_CONFIG_PATH = Path(self.temp_dir.name) / "dnsmasq.d" / "adblock.conf"
         admin_api.ADBLOCK_HOSTS_PATH = Path(self.temp_dir.name) / "ads.hosts"
         admin_api.ADBLOCK_STATE_PATH = Path(self.temp_dir.name) / "adblock.json"
+        admin_api.MAINTENANCE_STATE_PATH = Path(self.temp_dir.name) / "maintenance.json"
         admin_api.ADBLOCK_HOSTS_PATH.write_text("", encoding="utf-8")
         admin_api.WG_CONFIG_PATH.write_text("[Interface]\nAddress = 10.42.0.1/24\n", encoding="utf-8")
         admin_api.STATUS_PATH.write_text('{"protocols":{"services":{}}}', encoding="utf-8")
@@ -59,6 +61,7 @@ class AdminApiTests(unittest.TestCase):
         admin_api.ADBLOCK_CONFIG_PATH = self.original_adblock_config_path
         admin_api.ADBLOCK_HOSTS_PATH = self.original_adblock_hosts_path
         admin_api.ADBLOCK_STATE_PATH = self.original_adblock_state_path
+        admin_api.MAINTENANCE_STATE_PATH = self.original_maintenance_state_path
         self.temp_dir.cleanup()
 
     def request(self, method, path, payload=None, cookie=None, csrf=None, origin=None):
@@ -90,6 +93,157 @@ class AdminApiTests(unittest.TestCase):
         status, data, set_cookie = self.request("POST", "/api/login", {"username": username, "password": password})
         self.assertEqual(status, 200)
         return data, set_cookie
+
+    def test_client_duration_uses_seconds_and_rejects_invalid_values(self):
+        self.assertEqual(admin_api.parse_client_duration({"durationSeconds": 604800}), 604800)
+        self.assertEqual(admin_api.parse_client_duration({"durationDays": 7}), 604800)
+        self.assertEqual(admin_api.parse_client_duration({"durationSeconds": 0}), 0)
+        for payload in (
+            {"durationSeconds": -1},
+            {"durationSeconds": "1.5"},
+            {"durationSeconds": True},
+            {"durationSeconds": 31536001},
+        ):
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                admin_api.parse_client_duration(payload)
+
+    def test_adblock_profiles_and_custom_domains_are_validated_and_persisted(self):
+        login, cookie = self.sign_in()
+        _, _, cookie = self.request(
+            "POST",
+            "/api/password",
+            {"oldPassword": "temporary-passphrase", "newPassword": "longer-secure-passphrase-42"},
+            cookie=cookie,
+            csrf=login["csrfToken"],
+        )
+        _, session, _ = self.request("GET", "/api/session", cookie=cookie)
+
+        with patch.object(
+            admin_api.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, "", ""),
+        ) as run:
+            status, data, _ = self.request(
+                "POST",
+                "/api/adblock",
+                {
+                    "enabled": True,
+                    "level": "strict",
+                    "blockedDomains": [" Ads.Example.com ", "ads.example.com", "tracking.example.net"],
+                },
+                cookie=cookie,
+                csrf=session["csrfToken"],
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(data["adblock"]["level"], "strict")
+            self.assertEqual(
+                data["adblock"]["blockedDomains"],
+                ["ads.example.com", "tracking.example.net"],
+            )
+            self.assertIn("fakenews-gambling-porn/hosts", data["adblock"]["sourceUrl"])
+            self.assertEqual(
+                json.loads(admin_api.ADBLOCK_STATE_PATH.read_text(encoding="utf-8"))["blocked_domains"],
+                ["ads.example.com", "tracking.example.net"],
+            )
+            self.assertTrue(
+                any(call.args[0] == ["systemctl", "start", "--no-block", "vpn-adblock-update.service"] for call in run.call_args_list)
+            )
+
+            status, data, _ = self.request(
+                "POST",
+                "/api/adblock",
+                {"enabled": True, "level": "unknown", "blockedDomains": ["not a domain"]},
+                cookie=cookie,
+                csrf=session["csrfToken"],
+            )
+            self.assertEqual(status, 400)
+            self.assertIn("valid ad-blocking level", data["error"])
+            self.assertEqual(run.call_count, 3)
+
+            status, data, _ = self.request(
+                "POST",
+                "/api/adblock",
+                {"enabled": True, "level": "strict", "blockedDomains": ["not a domain"]},
+                cookie=cookie,
+                csrf=session["csrfToken"],
+            )
+            self.assertEqual(status, 400)
+            self.assertIn("Invalid blocked domain", data["error"])
+            self.assertEqual(run.call_count, 3)
+
+    def test_maintenance_notice_is_admin_managed_and_publicly_visible_on_portal(self):
+        login, cookie = self.sign_in()
+        _, _, cookie = self.request(
+            "POST",
+            "/api/password",
+            {"oldPassword": "temporary-passphrase", "newPassword": "longer-secure-passphrase-42"},
+            cookie=cookie,
+            csrf=login["csrfToken"],
+        )
+        _, session, _ = self.request("GET", "/api/session", cookie=cookie)
+
+        status, data, _ = self.request(
+            "POST",
+            "/api/maintenance",
+            {"enabled": True, "message": "Planned network maintenance."},
+            cookie=cookie,
+            csrf=session["csrfToken"],
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(data["maintenance"], {"enabled": True, "message": "Planned network maintenance."})
+
+        status, data, _ = self.request("GET", "/api/portal/session")
+        self.assertEqual(status, 200)
+        self.assertEqual(data["maintenance"], {"enabled": True, "message": "Planned network maintenance."})
+
+        status, data, _ = self.request(
+            "POST",
+            "/api/maintenance",
+            {"enabled": True, "message": "x" * 501},
+            cookie=cookie,
+            csrf=session["csrfToken"],
+        )
+        self.assertEqual(status, 400)
+
+        status, data, _ = self.request(
+            "POST",
+            "/api/maintenance",
+            {"enabled": False, "message": ""},
+            cookie=cookie,
+        )
+        self.assertEqual(status, 403)
+
+    def test_vpn_endpoint_helpers_format_ipv6_authorities(self):
+        with patch.dict(os.environ, {"DOMAIN": "2001:db8::10", "WG_PORT": "51820"}):
+            self.assertEqual(admin_api._wireguard_endpoint(), "[2001:db8::10]:51820")
+            self.assertEqual(admin_api._vpn_host(), "2001:db8::10")
+            self.assertEqual(admin_api._client_endpoint("wireguard"), "[2001:db8::10]:51820")
+            self.assertTrue(
+                admin_api.build_share_uri("ssh", "alice", "a-secret", "2001:db8::10")
+                .startswith("ssh://alice:a-secret@[2001:db8::10]:22")
+            )
+
+    def test_client_creation_rejects_bad_protocol_and_weak_password_before_provisioning(self):
+        login, cookie = self.sign_in()
+        _, _, cookie = self.request(
+            "POST",
+            "/api/password",
+            {"oldPassword": "temporary-passphrase", "newPassword": "longer-secure-passphrase-42"},
+            cookie=cookie,
+            csrf=login["csrfToken"],
+        )
+        _, session, _ = self.request("GET", "/api/session", cookie=cookie)
+        with patch.object(admin_api, "create_wireguard_client") as provision:
+            for payload in (
+                {"username": "field-device", "protocol": "unknown"},
+                {"username": "field-device", "password": "short"},
+            ):
+                status, data, _ = self.request(
+                    "POST", "/api/clients", payload, cookie=cookie, csrf=session["csrfToken"]
+                )
+                self.assertEqual(status, 400)
+                self.assertIn("error", data)
+            provision.assert_not_called()
 
     def test_status_requires_authentication(self):
         status, data, _ = self.request("GET", "/api/status")
@@ -216,6 +370,7 @@ class AdminApiTests(unittest.TestCase):
         with patch.dict(os.environ, {"DOMAIN": "vpn.example.test"}):
             transports = admin_api.xray_transports("test-uuid")
             _, account_share = admin_api.get_xray_client_share("xray-client")
+            account_transports = admin_api.get_xray_client_transports("xray-client")
 
         xhttp = next(item for item in transports if item["id"] == "vless-xhttp")
         self.assertEqual(
@@ -232,6 +387,10 @@ class AdminApiTests(unittest.TestCase):
         self.assertEqual(xhttp["path"], "/saeka-vless-xh")
         self.assertIn("path=%2Fsaeka-vless-xh", xhttp["share"])
         self.assertIn("path=%2Fsaeka-vless-xh", account_share)
+        self.assertIn(
+            "00000000-0000-4000-8000-000000000001@vpn.example.test",
+            next(item for item in account_transports if item["id"] == "vless-xhttp")["share"],
+        )
 
         generic_vless_share = admin_api.build_share_uri(
             "xray", "xray-client", "", "vpn.example.test"
@@ -251,6 +410,120 @@ class AdminApiTests(unittest.TestCase):
                 "trojan", "xray-client", "", "vpn.example.test"
             ).startswith("trojan://")
         )
+
+    def test_xray_revocation_removes_vless_vmess_and_trojan_credentials(self):
+        client_uuid = "00000000-0000-4000-8000-000000000001"
+        config_path = Path(self.temp_dir.name) / "xray.json"
+        config_path.write_text(json.dumps({
+            "inbounds": [
+                {"protocol": "vless", "settings": {"clients": [{"id": client_uuid}, {"id": "keep-vless"}]}},
+                {"protocol": "vmess", "settings": {"clients": [{"id": client_uuid}, {"id": "keep-vmess"}]}},
+                {"protocol": "trojan", "settings": {"clients": [{"password": client_uuid}, {"password": "keep-trojan"}]}},
+            ]
+        }), encoding="utf-8")
+        with admin_api.database() as connection:
+            connection.execute(
+                "INSERT INTO vpn_clients(id, username, public_key, private_key, address, created_at, protocol, metadata) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "xray-revoke",
+                    "xray-revoke",
+                    "xray:xray-revoke",
+                    "xray:xray-revoke",
+                    "xray:xray-revoke",
+                    int(time.time()),
+                    "xray",
+                    json.dumps({"uuid": client_uuid}),
+                ),
+            )
+
+        with patch.object(admin_api, "XRAY_CONFIG_PATH", config_path), patch.object(
+            admin_api.subprocess, "run"
+        ):
+            admin_api.revoke_xray_client("xray-revoke")
+
+        inbounds = json.loads(config_path.read_text(encoding="utf-8"))["inbounds"]
+        for inbound in inbounds:
+            key = "password" if inbound["protocol"] == "trojan" else "id"
+            self.assertNotIn(client_uuid, [client[key] for client in inbound["settings"]["clients"]])
+
+    def test_expired_non_wireguard_account_uses_protocol_revoker(self):
+        now = int(time.time())
+        with admin_api.database() as connection:
+            connection.execute(
+                "INSERT INTO vpn_clients(id, username, public_key, private_key, address, created_at, expires_at, protocol) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("expired-ssh", "expired-ssh", "ssh:key", "ssh:key", "ssh:key", now - 100, now - 1, "ssh"),
+            )
+
+        with patch.object(admin_api, "revoke_ssh_client") as revoke:
+            admin_api.expire_non_wireguard_clients(now)
+
+        revoke.assert_called_once_with("expired-ssh")
+
+    def test_all_protocol_client_listing_reports_portal_login_state(self):
+        now = int(time.time())
+        with admin_api.database() as connection:
+            connection.execute(
+                "INSERT INTO vpn_clients(id, username, public_key, private_key, address, created_at, protocol, password_hash) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("ssh-client", "ssh-client", "ssh:key", "ssh:key", "ssh:key", now, "ssh", b"hashed-password"),
+            )
+
+        with patch.object(admin_api, "list_wireguard_clients", return_value=[]):
+            client = admin_api.list_all_clients()[0]
+
+        self.assertTrue(client["portalReady"])
+        self.assertNotIn("password_hash", client)
+
+    def test_ipsec_export_contains_current_eap_credentials(self):
+        now = int(time.time())
+        secrets_path = Path(self.temp_dir.name) / "ipsec.secrets"
+        secrets_path.write_text('ike-user : EAP "ike-secret-value"\n', encoding="utf-8")
+        with admin_api.database() as connection:
+            connection.execute(
+                "INSERT INTO vpn_clients(id, username, public_key, private_key, address, created_at, protocol) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("ipsec-client", "ike-user", "ipsec:key", "ipsec:key", "ipsec:key", now, "ipsec"),
+            )
+
+        with patch.object(admin_api, "IPSEC_SECRETS", secrets_path), patch.dict(
+            os.environ, {"DOMAIN": "vpn.example.test"}
+        ):
+            username, config = admin_api.get_ipsec_client_info("ipsec-client")
+
+        self.assertEqual(username, "ike-user")
+        self.assertIn("Password: ike-secret-value", config)
+        self.assertEqual(
+            admin_api.get_config_meta("ipsec")[:2],
+            ("txt", "text/plain; charset=utf-8"),
+        )
+
+    def test_openvpn_revocation_installs_generated_crl(self):
+        now = int(time.time())
+        easy_rsa = Path(self.temp_dir.name) / "easy-rsa"
+        crl_source = easy_rsa / "pki" / "crl.pem"
+        crl_source.parent.mkdir(parents=True)
+        crl_source.write_text("revoked certificate list\n", encoding="utf-8")
+        crl_target = Path(self.temp_dir.name) / "server" / "crl.pem"
+        with admin_api.database() as connection:
+            connection.execute(
+                "INSERT INTO vpn_clients(id, username, public_key, private_key, address, created_at, protocol) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("openvpn-client", "ovpn-user", "ovpn:key", "ovpn:key", "ovpn:key", now, "openvpn"),
+            )
+
+        completed = admin_api.subprocess.CompletedProcess([], 0, "", "")
+        with patch.object(admin_api, "EASYRSA_DIR", easy_rsa), patch.object(
+            admin_api, "OPENVPN_CRL_PATH", crl_target
+        ), patch.object(admin_api.subprocess, "run", return_value=completed):
+            admin_api.revoke_openvpn_client("openvpn-client")
+
+        self.assertEqual(crl_target.read_text(encoding="utf-8"), "revoked certificate list\n")
+        with admin_api.database() as connection:
+            self.assertIsNone(
+                connection.execute("SELECT id FROM vpn_clients WHERE id = ?", ("openvpn-client",)).fetchone()
+            )
 
     def test_wireguard_client_lifecycle_requires_csrf_and_provisions_config(self):
         login, cookie = self.sign_in()
@@ -298,13 +571,14 @@ class AdminApiTests(unittest.TestCase):
             status, created, _ = self.request(
                 "POST",
                 "/api/clients",
-                {"username": "field-laptop", "durationDays": 7},
+                {"username": " field-laptop ", "durationDays": 7},
                 cookie=cookie,
                 csrf=csrf,
             )
             self.assertEqual(status, 201)
             self.assertEqual(created["client"]["address"], "10.42.0.3")
             self.assertEqual(created["client"]["username"], "field-laptop")
+            self.assertEqual(created["client"]["protocol"], "wireguard")
             self.assertTrue(created["client"]["temporaryPassword"])
             self.assertIn("PrivateKey = client-private", created["config"])
             self.assertIn("Endpoint = vpn.example.test:51820", created["config"])
